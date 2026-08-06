@@ -27,6 +27,22 @@ function pad(n) { return String(n).padStart(2, "0"); }
 function toISODate(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
 function startOfWeek(d) { const date = new Date(d); const day = (date.getDay() + 6) % 7; date.setDate(date.getDate() - day); date.setHours(0, 0, 0, 0); return date; }
 function addDays(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
+function addMonths(d, n) { const r = new Date(d); r.setDate(1); r.setMonth(r.getMonth() + n); return r; }
+function addYears(d, n) { const r = new Date(d); r.setFullYear(r.getFullYear() + n); return r; }
+function startOfMonth(d) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+function monthMatrix(d) {
+  const first = startOfMonth(d);
+  const gridStart = startOfWeek(first);
+  const weeks = [];
+  let cursor = gridStart;
+  for (let w = 0; w < 6; w++) {
+    const week = [];
+    for (let i = 0; i < 7; i++) { week.push(cursor); cursor = addDays(cursor, 1); }
+    weeks.push(week);
+    if (cursor > addDays(first, 40) && week.some(d2 => d2.getMonth() !== first.getMonth() && d2 > first)) break;
+  }
+  return weeks;
+}
 const DAY_NAMES = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Nie"];
 const MONTH_NAMES = ["stycznia","lutego","marca","kwietnia","maja","czerwca","lipca","sierpnia","września","października","listopada","grudnia"];
 function timeToMin(t) { const [h, m] = t.split(":").map(Number); return h * 60 + m; }
@@ -101,7 +117,8 @@ export default function App() {
   const loggedLoginRef = useRef(false);
 
   const [view, setView] = useState("calendar");
-  const [weekStart, setWeekStart] = useState(startOfWeek(new Date()));
+  const [calView, setCalView] = useState("week"); // day | week | month | year
+  const [anchorDate, setAnchorDate] = useState(startOfWeek(new Date()));
   const [filterUserIds, setFilterUserIds] = useState(null);
   const [showNewEvent, setShowNewEvent] = useState(null);
   const [showEditEvent, setShowEditEvent] = useState(null);
@@ -380,7 +397,7 @@ export default function App() {
         {view === "calendar" && (
           <CalendarView
             profiles={profiles} events={events} profile={profile}
-            weekStart={weekStart} setWeekStart={setWeekStart}
+            calView={calView} setCalView={setCalView} anchorDate={anchorDate} setAnchorDate={setAnchorDate}
             filterUserIds={filterUserIds} setFilterUserIds={setFilterUserIds}
             onNewEvent={(date) => setShowNewEvent({ date })}
             onEditEvent={(ev) => setShowEditEvent(ev)}
@@ -601,18 +618,43 @@ function TopNav({ profile, view, setView, unreadCount, pendingCount, onLogout, o
 }
 
 // ================= CALENDAR =================
-function CalendarView({ profiles, events, profile, weekStart, setWeekStart, filterUserIds, setFilterUserIds, onNewEvent, onEditEvent }) {
-  const days = [0, 1, 2, 3, 4, 5, 6].map(i => addDays(weekStart, i));
+function CalendarView({ profiles, events, profile, calView, setCalView, anchorDate, setAnchorDate, filterUserIds, setFilterUserIds, onNewEvent, onEditEvent }) {
   const activeFilter = filterUserIds || profiles.map(u => u.id);
+
+  function nav(dir) {
+    if (calView === "day") setAnchorDate(addDays(anchorDate, dir));
+    else if (calView === "week") setAnchorDate(addDays(anchorDate, dir * 7));
+    else if (calView === "month") setAnchorDate(addMonths(anchorDate, dir));
+    else setAnchorDate(addYears(anchorDate, dir));
+  }
+  function goToday() {
+    const t = new Date();
+    setAnchorDate(calView === "week" ? startOfWeek(t) : t);
+  }
+  function goToDay(d) { setAnchorDate(d); setCalView("day"); }
+
+  const eventsForDay = (iso) => events.filter(e => e.date === iso).filter(e => e.participants.some(p => activeFilter.includes(p.userId) && p.status !== "declined")).sort((a, b) => timeToMin(a.start) - timeToMin(b.start));
+
+  let label = "";
+  if (calView === "day") label = `${DAY_NAMES[(anchorDate.getDay() + 6) % 7]}, ${anchorDate.getDate()} ${MONTH_NAMES[anchorDate.getMonth()]} ${anchorDate.getFullYear()}`;
+  else if (calView === "week") { const ws = startOfWeek(anchorDate); const we = addDays(ws, 6); label = `${ws.getDate()} ${MONTH_NAMES[ws.getMonth()]} – ${we.getDate()} ${MONTH_NAMES[we.getMonth()]} ${we.getFullYear()}`; }
+  else if (calView === "month") label = `${MONTH_NAMES[anchorDate.getMonth()][0].toUpperCase()}${MONTH_NAMES[anchorDate.getMonth()].slice(1)} ${anchorDate.getFullYear()}`;
+  else label = `${anchorDate.getFullYear()}`;
+
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-        <button onClick={() => setWeekStart(addDays(weekStart, -7))} style={navBtnStyle()}><ChevronLeft size={16} /></button>
-        <button onClick={() => setWeekStart(addDays(weekStart, 7))} style={navBtnStyle()}><ChevronRight size={16} /></button>
-        <button onClick={() => setWeekStart(startOfWeek(new Date()))} style={{ ...navBtnStyle(), fontSize: 12, padding: "6px 10px" }}>Dziś</button>
-        <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 600, fontSize: 15, marginLeft: 4 }}>
-          {days[0].getDate()} {MONTH_NAMES[days[0].getMonth()]} – {days[6].getDate()} {MONTH_NAMES[days[6].getMonth()]} {days[6].getFullYear()}
+        <button onClick={() => nav(-1)} style={navBtnStyle()}><ChevronLeft size={16} /></button>
+        <button onClick={() => nav(1)} style={navBtnStyle()}><ChevronRight size={16} /></button>
+        <button onClick={goToday} style={{ ...navBtnStyle(), fontSize: 12, padding: "6px 10px" }}>Dziś</button>
+        <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 600, fontSize: 15, marginLeft: 4 }}>{label}</div>
+
+        <div style={{ display: "flex", gap: 4, marginLeft: 8 }}>
+          {[["day", "Dzień"], ["week", "Tydzień"], ["month", "Miesiąc"], ["year", "Rok"]].map(([id, lbl]) => (
+            <button key={id} onClick={() => setCalView(id)} style={{ padding: "6px 10px", borderRadius: 8, fontSize: 12, cursor: "pointer", border: `1px solid ${calView === id ? COLORS.amber : COLORS.line}`, background: calView === id ? COLORS.amber + "22" : "transparent", color: calView === id ? COLORS.text : COLORS.textMuted }}>{lbl}</button>
+          ))}
         </div>
+
         <div style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
           {profiles.map(u => {
             const on = activeFilter.includes(u.id);
@@ -624,33 +666,143 @@ function CalendarView({ profiles, events, profile, weekStart, setWeekStart, filt
             );
           })}
         </div>
-        <button onClick={() => onNewEvent(toISODate(new Date()))} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9, border: "none", background: COLORS.amber, color: "#12141C", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
+        <button onClick={() => onNewEvent(toISODate(calView === "day" ? anchorDate : new Date()))} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9, border: "none", background: COLORS.amber, color: "#12141C", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
           <Plus size={15} /> Nowy termin
         </button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(140px, 1fr))", gap: 10, overflowX: "auto" }}>
-        {days.map(day => {
-          const iso = toISODate(day);
-          const isToday = iso === toISODate(new Date());
-          const dayEvents = events.filter(e => e.date === iso).filter(e => e.participants.some(p => activeFilter.includes(p.userId) && p.status !== "declined")).sort((a, b) => timeToMin(a.start) - timeToMin(b.start));
-          return (
-            <div key={iso} style={{ background: COLORS.panel, border: `1px solid ${isToday ? COLORS.amber : COLORS.line}`, borderRadius: 12, padding: 10, minHeight: 220, display: "flex", flexDirection: "column" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <div style={{ fontSize: 11.5, color: isToday ? COLORS.amber : COLORS.textMuted, fontWeight: 600 }}>{DAY_NAMES[(day.getDay() + 6) % 7]} {day.getDate()}</div>
-                <button onClick={() => onNewEvent(iso)} style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer" }}><Plus size={13} /></button>
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1 }}>
-                {dayEvents.length === 0 && <div style={{ fontSize: 11, color: COLORS.textMuted, opacity: 0.5, marginTop: 6 }}>—</div>}
-                {dayEvents.map(ev => <EventCard key={ev.id} ev={ev} profiles={profiles} onClick={() => onEditEvent(ev)} />)}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+
+      {calView === "day" && <DayView day={anchorDate} profiles={profiles} eventsForDay={eventsForDay} onNewEvent={onNewEvent} onEditEvent={onEditEvent} />}
+      {calView === "week" && <WeekView weekStart={startOfWeek(anchorDate)} profiles={profiles} eventsForDay={eventsForDay} onNewEvent={onNewEvent} onEditEvent={onEditEvent} />}
+      {calView === "month" && <MonthView anchorDate={anchorDate} profiles={profiles} eventsForDay={eventsForDay} onNewEvent={onNewEvent} onDayClick={goToDay} />}
+      {calView === "year" && <YearView anchorDate={anchorDate} eventsForDay={eventsForDay} onMonthClick={(d) => { setAnchorDate(d); setCalView("month"); }} onDayClick={goToDay} />}
     </div>
   );
 }
 function navBtnStyle() { return { background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "6px 8px", color: COLORS.text, cursor: "pointer", display: "flex" }; }
+
+function DayView({ day, profiles, eventsForDay, onNewEvent, onEditEvent }) {
+  const iso = toISODate(day);
+  const dayEvents = eventsForDay(iso);
+  return (
+    <div style={{ maxWidth: 480 }}>
+      <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, display: "flex", flexDirection: "column", gap: 8, minHeight: 240 }}>
+        {dayEvents.length === 0 && (
+          <div style={{ fontSize: 13, color: COLORS.textMuted, textAlign: "center", padding: "30px 0" }}>
+            Brak terminów tego dnia.
+            <div><button onClick={() => onNewEvent(iso)} style={{ marginTop: 10, ...primaryBtnStyle() }}>Dodaj termin</button></div>
+          </div>
+        )}
+        {dayEvents.map(ev => <EventCard key={ev.id} ev={ev} profiles={profiles} onClick={() => onEditEvent(ev)} />)}
+      </div>
+    </div>
+  );
+}
+
+function WeekView({ weekStart, profiles, eventsForDay, onNewEvent, onEditEvent }) {
+  const days = [0, 1, 2, 3, 4, 5, 6].map(i => addDays(weekStart, i));
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(140px, 1fr))", gap: 10, overflowX: "auto" }}>
+      {days.map(day => {
+        const iso = toISODate(day);
+        const isToday = iso === toISODate(new Date());
+        const dayEvents = eventsForDay(iso);
+        return (
+          <div key={iso} style={{ background: COLORS.panel, border: `1px solid ${isToday ? COLORS.amber : COLORS.line}`, borderRadius: 12, padding: 10, minHeight: 220, display: "flex", flexDirection: "column" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ fontSize: 11.5, color: isToday ? COLORS.amber : COLORS.textMuted, fontWeight: 600 }}>{DAY_NAMES[(day.getDay() + 6) % 7]} {day.getDate()}</div>
+              <button onClick={() => onNewEvent(iso)} style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer" }}><Plus size={13} /></button>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1 }}>
+              {dayEvents.length === 0 && <div style={{ fontSize: 11, color: COLORS.textMuted, opacity: 0.5, marginTop: 6 }}>—</div>}
+              {dayEvents.map(ev => <EventCard key={ev.id} ev={ev} profiles={profiles} onClick={() => onEditEvent(ev)} />)}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick }) {
+  const weeks = monthMatrix(anchorDate);
+  const currentMonth = anchorDate.getMonth();
+  const todayIso = toISODate(new Date());
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6, marginBottom: 6 }}>
+        {DAY_NAMES.map(d => <div key={d} style={{ fontSize: 11, color: COLORS.textMuted, textAlign: "center", fontWeight: 600 }}>{d}</div>)}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {weeks.map((week, wi) => (
+          <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+            {week.map(day => {
+              const iso = toISODate(day);
+              const inMonth = day.getMonth() === currentMonth;
+              const isToday = iso === todayIso;
+              const dayEvents = eventsForDay(iso);
+              return (
+                <div key={iso} onClick={() => onDayClick(day)} style={{
+                  cursor: "pointer", minHeight: 84, borderRadius: 9, padding: 6, background: inMonth ? COLORS.panel : "transparent",
+                  border: `1px solid ${isToday ? COLORS.amber : COLORS.line}`, opacity: inMonth ? 1 : 0.4, display: "flex", flexDirection: "column",
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: isToday ? COLORS.amber : COLORS.textMuted, fontWeight: isToday ? 700 : 500 }}>{day.getDate()}</span>
+                    <button onClick={(e) => { e.stopPropagation(); onNewEvent(iso); }} style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer", padding: 0, display: "flex" }}><Plus size={11} /></button>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }}>
+                    {dayEvents.slice(0, 3).map(ev => (
+                      <div key={ev.id} style={{ fontSize: 10, borderRadius: 4, padding: "1px 4px", background: COLORS.bg, color: ev.detailed ? COLORS.text : COLORS.textMuted, borderLeft: `2px solid ${userColor(ev.ownerId, profiles)}`, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {ev.start} {ev.detailed ? (ev.title || "") : "Zajęty/a"}
+                      </div>
+                    ))}
+                    {dayEvents.length > 3 && <div style={{ fontSize: 9.5, color: COLORS.textMuted }}>+{dayEvents.length - 3} więcej</div>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function YearView({ anchorDate, eventsForDay, onMonthClick, onDayClick }) {
+  const year = anchorDate.getFullYear();
+  const todayIso = toISODate(new Date());
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 14 }}>
+      {MONTH_NAMES.map((mName, mi) => {
+        const monthDate = new Date(year, mi, 1);
+        const weeks = monthMatrix(monthDate);
+        return (
+          <div key={mi} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 10 }}>
+            <div onClick={() => onMonthClick(monthDate)} style={{ cursor: "pointer", fontSize: 12.5, fontWeight: 600, marginBottom: 6, textTransform: "capitalize" }}>{mName}</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2 }}>
+              {weeks.flat().map((day, i) => {
+                const iso = toISODate(day);
+                const inMonth = day.getMonth() === mi;
+                const isToday = iso === todayIso;
+                const hasEvents = inMonth && eventsForDay(iso).length > 0;
+                return (
+                  <div key={i} onClick={() => inMonth && onDayClick(day)} style={{
+                    aspectRatio: "1", display: "flex", alignItems: "center", justifyContent: "center", position: "relative",
+                    fontSize: 9.5, borderRadius: 4, cursor: inMonth ? "pointer" : "default",
+                    color: !inMonth ? COLORS.line : isToday ? "#12141C" : COLORS.textMuted,
+                    background: isToday ? COLORS.amber : "transparent", fontWeight: isToday ? 700 : 400,
+                  }}>
+                    {inMonth ? day.getDate() : ""}
+                    {hasEvents && !isToday && <span style={{ position: "absolute", bottom: 1, width: 3, height: 3, borderRadius: "50%", background: COLORS.amber }} />}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 function EventCard({ ev, profiles, onClick }) {
   const ownerColor = userColor(ev.ownerId, profiles);

@@ -113,10 +113,28 @@ create policy "profiles_update_self" on public.profiles for update using (auth.u
 create policy "profiles_update_admin" on public.profiles for update using (public.is_admin()) with check (public.is_admin());
 
 -- events: zatwierdzeni widzą wszystkie terminy; tworzy właściciel; edytuje właściciel lub admin
-create policy "events_select" on public.events for select using (public.is_approved());
+create policy "events_select" on public.events for select
+  using (
+    public.is_approved() and (
+      owner_id = auth.uid()
+      or public.is_admin()
+      or exists (select 1 from public.event_participants ep where ep.event_id = events.id and ep.user_id = auth.uid())
+    )
+  );
 create policy "events_insert" on public.events for insert with check (public.is_approved() and owner_id = auth.uid());
 create policy "events_update" on public.events for update using (public.is_approved() and (owner_id = auth.uid() or public.is_admin()));
 create policy "events_delete" on public.events for delete using (public.is_approved() and (owner_id = auth.uid() or public.is_admin()));
+
+-- widok z minimalnymi danymi terminu (bez tytułu/lokalizacji/notatek) — widoczny dla
+-- każdego zatwierdzonego użytkownika, potrzebny do wykrywania konfliktów bez ujawniania
+-- treści cudzych terminów
+create or replace view public.event_busy_view as
+select e.id as event_id, e.date, e.start_time, e.end_time, e.owner_id, ep.user_id, ep.status
+from public.events e
+join public.event_participants ep on ep.event_id = e.id
+where ep.status <> 'declined';
+
+grant select on public.event_busy_view to authenticated;
 
 -- event_participants: zatwierdzeni widzą wszystko (potrzebne do wykrywania konfliktów);
 -- dopisywać uczestników może każdy zatwierdzony; zmieniać status (akceptuj/odrzuć) tylko sam siebie lub admin
@@ -136,6 +154,18 @@ create policy "join_requests_select" on public.join_requests for select using (f
 create policy "join_requests_insert" on public.join_requests for insert with check (public.is_approved() and from_user_id = auth.uid());
 create policy "join_requests_update" on public.join_requests for update using (to_user_id = auth.uid() or public.is_admin());
 
+-- audit_log: log aktywności, widoczny tylko dla admina; każdy zatwierdzony user zapisuje własne akcje
+create table if not exists public.audit_log (
+  id uuid primary key default gen_random_uuid(),
+  actor_id uuid references public.profiles(id) on delete set null,
+  action text not null,
+  details text,
+  created_at timestamptz not null default now()
+);
+alter table public.audit_log enable row level security;
+create policy "audit_log_select_admin" on public.audit_log for select using (public.is_admin());
+create policy "audit_log_insert" on public.audit_log for insert with check (actor_id = auth.uid());
+
 -- ---------- REALTIME ----------
 -- Włącza natychmiastowe aktualizacje (bez tego trzeba by odpytywać bazę ręcznie)
 alter publication supabase_realtime add table public.profiles;
@@ -143,3 +173,4 @@ alter publication supabase_realtime add table public.events;
 alter publication supabase_realtime add table public.event_participants;
 alter publication supabase_realtime add table public.notifications;
 alter publication supabase_realtime add table public.join_requests;
+alter publication supabase_realtime add table public.audit_log;

@@ -90,12 +90,20 @@ To rozwiązanie zabezpieczeń (RLS w bazie) jest dopasowane do małego, zaufaneg
 
 Darmowy plan Supabase i darmowy plan Netlify w zupełności wystarczą na zespół do 5 osób — to nie jest coś, co przy tej skali zacznie kosztować.
 
-## Rozwój aplikacji
+## Aktualizacja: prywatność terminów, log aktywności, instalacja jako aplikacja (PWA)
 
-Lista funkcji, które omawialiśmy, a jeszcze nie ma w kodzie (daj znać, które chcesz jako kolejne):
-- Bufor czasowy między dwiema lokalizacjami tej samej osoby.
-- Historia/log zmian (kto, kiedy, co zmienił).
-- Status "wstępny" (zarezerwowany, ale niepotwierdzony).
-- Widok miesięczny.
-- Eksport do pliku .ics (import do Google/Outlook/Apple Calendar).
-- Komentarz/kontrpropozycja przy prośbie o zmianę terminu, zamiast tylko tak/nie.
+Jeśli już wdrożyłeś wcześniejszą wersję, zrób to teraz:
+
+1. **Baza danych**: w Supabase → SQL Editor → wklej i uruchom `supabase/migration-privacy-audit.sql`. To dokłada: ukrywanie tytułu/lokalizacji/notatek terminu przed osobami, które nie są jego uczestnikami (widzą tylko że dana osoba jest zajęta, o określonych godzinach), oraz tabelę z logiem aktywności widoczną tylko dla admina (Panel admina → zakładka "Aktywność" — logowania, tworzenie/edycja/usuwanie terminów, zaproszenia, prośby o zmianę terminu, zmiany profilu, decyzje admina).
+2. **Kod**: podmień pliki `src/App.jsx`, `index.html`, `src/main.jsx` oraz dodaj nowe: `public/manifest.json`, `public/sw.js`, folder `public/icons/` (cztery pliki PNG) — na GitHubie przez "Add file → Upload files", przeciągając te pliki (zachowując strukturę folderów tak jak poprzednio).
+3. Po wgraniu na GitHub, Netlify sam zbuduje nową wersję (masz włączone ciągłe wdrażanie z GitHuba).
+
+**Instalacja na telefonie/komputerze:**
+- **Android (Chrome)** i **komputer (Chrome/Edge)**: w aplikacji pojawi się przycisk "Zainstaluj" w górnym pasku — wystarczy kliknąć. Można też użyć menu przeglądarki → "Zainstaluj aplikację" / "Dodaj do ekranu głównego".
+- **iPhone/iPad (Safari)**: Apple nie pozwala przeglądarce pokazać własnego przycisku instalacji — trzeba to zrobić ręcznie: otwórz stronę w Safari → przycisk "Udostępnij" (kwadrat ze strzałką) → **"Dodaj do ekranu początkowego"**.
+- Uwaga: to wciąż jest aplikacja internetowa działająca na żywo z bazą danych — instalacja daje wygodną ikonkę i pełnoekranowy widok bez paska adresu, ale do działania nadal potrzebne jest połączenie z internetem.
+
+## Wiele zespołów w jednej aplikacji?
+
+To jest możliwe (tzw. multi-tenancy), ale wymaga kolejnej, sporej przebudowy: dodania pojęcia "organizacji" (każdy profil, termin, powiadomienie przypisany do konkretnej firmy/zespołu), osobnych reguł dostępu tak, żeby zespół A w ogóle nie widział danych zespołu B, oraz decyzji, jak nowe organizacje miałyby powstawać (np. pierwsza osoba z nowej firmy zakłada organizację przy rejestracji zamiast dołączać do istniejącej). Jedna instalacja na Supabase/Netlify obsłużyłaby wtedy dowolną liczbę niezależnych zespołów. To osobny, zamknięty temat — daj znać, jeśli chcesz, żebym to zaprojektował i wdrożył.
+
