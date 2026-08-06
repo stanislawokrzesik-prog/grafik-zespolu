@@ -63,6 +63,12 @@ const DAY_NAMES = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Nie"];
 const MONTH_NAMES = ["stycznia","lutego","marca","kwietnia","maja","czerwca","lipca","sierpnia","września","października","listopada","grudnia"];
 function timeToMin(t) { const [h, m] = t.split(":").map(Number); return h * 60 + m; }
 function overlaps(aStart, aEnd, bStart, bEnd) { return timeToMin(aStart) < timeToMin(bEnd) && timeToMin(bStart) < timeToMin(aEnd); }
+// Jak overlaps(), ale dodatkowo traktuje jako "zajęte" zbyt krótkie przerwy między
+// terminami (np. brak czasu na dojazd) — bufferMin to minimalny odstęp w minutach.
+function overlapsWithBuffer(aStart, aEnd, bStart, bEnd, bufferMin) {
+  const aS = timeToMin(aStart) - bufferMin, aE = timeToMin(aEnd) + bufferMin;
+  return aS < timeToMin(bEnd) && timeToMin(bStart) < aE;
+}
 function userColor(userId, profiles) { const u = profiles.find(p => p.id === userId); return u ? u.color : COLORS.textMuted; }
 function userName(userId, profiles) { const u = profiles.find(p => p.id === userId); return u ? u.name : "(usunięty)"; }
 function buildJoinRequestText(fromName, conflictEvent, draftEvent, message) {
@@ -159,6 +165,11 @@ async function fetchAuditLog() {
   if (error) return []; // non-admins get an RLS error here — that's expected, just show nothing
   return (data || []).map(a => ({ id: a.id, actorId: a.actor_id, action: a.action, details: a.details, timestamp: new Date(a.created_at).getTime() }));
 }
+async function fetchAppSettings() {
+  const { data, error } = await supabase.from("app_settings").select("*").eq("id", "default").maybeSingle();
+  if (error || !data) return null;
+  return data;
+}
 
 export default function App() {
   const [booting, setBooting] = useState(true);
@@ -172,6 +183,7 @@ export default function App() {
   const [notifications, setNotifications] = useState([]);
   const [joinRequests, setJoinRequests] = useState([]);
   const [auditLog, setAuditLog] = useState([]);
+  const [bufferMinutes, setBufferMinutesState] = useState(120);
   const loggedLoginRef = useRef(false);
 
   const [view, setView] = useState("calendar");
@@ -231,15 +243,16 @@ export default function App() {
   const refreshAll = useCallback(async () => {
     try {
       const isAdmin = profile?.role === "admin";
-      const [p, e, n, j, a, rb] = await Promise.all([
+      const [p, e, n, j, a, rb, settings] = await Promise.all([
         fetchProfiles(), fetchEvents(isAdmin), fetchNotifications(), fetchJoinRequests(),
-        isAdmin ? fetchAuditLog() : Promise.resolve([]), fetchRecurringBlocks(isAdmin),
+        isAdmin ? fetchAuditLog() : Promise.resolve([]), fetchRecurringBlocks(isAdmin), fetchAppSettings(),
       ]);
       const windowStart = toISODate(addDays(new Date(), -30));
       const windowEnd = toISODate(addDays(new Date(), 400));
       const virtualEvents = expandRecurringBlocks(rb, windowStart, windowEnd);
       setProfiles(p); setEvents([...e, ...virtualEvents]); setRecurringBlocks(rb);
       setNotifications(n); setJoinRequests(j); setAuditLog(a);
+      if (settings) setBufferMinutesState(settings.buffer_minutes);
     } catch (err) { console.error("Błąd wczytywania danych", err); }
   }, [profile?.role]);
 
@@ -314,7 +327,7 @@ export default function App() {
       if (ev.id === excludeEventId || ev.date !== date) return false;
       const p = ev.participants.find(p => p.userId === userId && p.status !== "declined");
       if (!p) return false;
-      return overlaps(start, end, ev.start, ev.end);
+      return overlapsWithBuffer(start, end, ev.start, ev.end, bufferMinutes);
     });
   }
   function conflictEventFor(userId, date, start, end, excludeEventId) {
@@ -322,7 +335,7 @@ export default function App() {
       if (ev.id === excludeEventId || ev.date !== date) return false;
       const p = ev.participants.find(p => p.userId === userId && p.status !== "declined");
       if (!p) return false;
-      return overlaps(start, end, ev.start, ev.end);
+      return overlapsWithBuffer(start, end, ev.start, ev.end, bufferMinutes);
     });
   }
 
@@ -417,6 +430,7 @@ export default function App() {
 
     const participantRows = inserted.map(ev => ({ event_id: ev.id, user_id: profile.id, status: "accepted" }));
     let pendingApproval = 0;
+    const pendingDetails = [];
     if (form.type === "work") {
       for (let idx = 0; idx < inserted.length; idx++) {
         const ev = inserted[idx];
@@ -433,6 +447,7 @@ export default function App() {
             }).select().single();
             await pushNotification(pid, "join_request", buildJoinRequestText(profile.name, conflict, { ...ev, start: ev.start_time, end: ev.end_time, location: form.location }, form.joinMessage), { requestId: jr.id });
             pendingApproval++;
+            pendingDetails.push({ date: ev.date, name: profiles.find(p => p.id === pid)?.name || "?" });
           } else {
             participantRows.push({ event_id: ev.id, user_id: pid, status: "pending" });
             await pushNotification(pid, "invite", `${profile.name} zaprasza Cię do wspólnej pracy „${ev.title}” — ${ev.date} ${ev.all_day ? "cały dzień" : `${ev.start_time}–${ev.end_time}`}${form.location ? " @ " + form.location : ""}.`, { eventId: ev.id });
@@ -448,7 +463,7 @@ export default function App() {
 
     await logAction("event_created", `${profile.name} dodał(a) serię terminów „${form.title || (form.type === "block" ? "Niedostępny/a" : "")}” na ${entries.length} dni.`);
     refreshAll();
-    return { ok: true, count: entries.length, skipped: pendingApproval };
+    return { ok: true, count: entries.length, skipped: pendingApproval, pendingDetails };
   }
 
   async function createRecurringBlock(form) {
@@ -566,6 +581,11 @@ export default function App() {
   async function adminSendPasswordReset(email) {
     await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
   }
+  async function adminSetBufferMinutes(minutes) {
+    await supabase.from("app_settings").update({ buffer_minutes: minutes, updated_at: new Date().toISOString() }).eq("id", "default");
+    setBufferMinutesState(minutes);
+    await logAction("buffer_updated", `${profile.name} ustawił(a) bufor czasowy między zadaniami na ${minutes} min.`);
+  }
 
   const myNotifs = profile ? notifications.filter(n => n.userId === profile.id).sort((a, b) => b.timestamp - a.timestamp) : [];
   const unreadCount = myNotifs.filter(n => !n.read).length;
@@ -618,6 +638,7 @@ export default function App() {
             onSetApproved={adminSetApproved} onSetRole={adminSetRole}
             onSendPasswordReset={adminSendPasswordReset}
             onDeleteEvent={deleteEvent} onEditEvent={(ev) => setShowEditEvent(ev)}
+            bufferMinutes={bufferMinutes} onSetBufferMinutes={adminSetBufferMinutes}
           />
         )}
       </div>
@@ -1141,7 +1162,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
       if (badEntry) { setSeriesError(`Podaj godziny dla dnia ${badEntry.date} albo zaznacz dla niego „Cały dzień”.`); return; }
       if (form.type === "work" && !form.title.trim()) { setSeriesError("Podaj tytuł terminu."); return; }
       const res = await onSubmitSeries({ ...form, title: form.title.trim() || (form.type === "block" ? "Niedostępny/a" : "") });
-      if (res && res.ok) setSeriesResult({ count: res.count, skipped: res.skipped });
+      if (res && res.ok) setSeriesResult({ count: res.count, skipped: res.skipped, pendingDetails: res.pendingDetails });
       else setSeriesError((res && res.error) || "Coś poszło nie tak.");
       return;
     }
@@ -1157,7 +1178,14 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
       <ModalShell onClose={onClose} title="Seria dodana">
         <div style={{ fontSize: 13, color: COLORS.text, lineHeight: 1.6, marginBottom: 14 }}>
           Dodano terminy na <b>{seriesResult.count}</b> {seriesResult.count === 1 ? "dzień" : "dni"}.
-          {seriesResult.skipped > 0 && <div style={{ color: COLORS.amber, marginTop: 6 }}>Dla {seriesResult.skipped} {seriesResult.skipped === 1 ? "osoby, która była" : "osób, które były"} zajęte danego dnia, wysłano zapytanie o akceptację zamiast zwykłego zaproszenia — dostaniesz powiadomienie o ich decyzji.</div>}
+          {seriesResult.skipped > 0 && (
+            <div style={{ color: COLORS.amber, marginTop: 6 }}>
+              <div>Dla {seriesResult.skipped} {seriesResult.skipped === 1 ? "przypadku" : "przypadków"} (osoba zajęta danego dnia) wysłano zapytanie o akceptację zamiast zwykłego zaproszenia:</div>
+              <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 12.5 }}>
+                {(seriesResult.pendingDetails || []).map((d, i) => <li key={i}>{d.date} — {d.name}</li>)}
+              </ul>
+            </div>
+          )}
         </div>
         <button onClick={onClose} style={primaryBtnStyle()}>OK</button>
       </ModalShell>
@@ -1264,19 +1292,38 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
               </div>
               {seriesError && <div style={{ fontSize: 11.5, color: COLORS.rose }}>{seriesError}</div>}
 
-              {form.entries.length > 0 && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 320, overflowY: "auto" }}>
+              {form.entries.length > 0 && (() => {
+                const conflictCount = form.type === "work" ? form.entries.filter(e => e.participantIds.some(pid => isUserBusy(pid, e.date, e.allDay ? "00:00" : e.start, e.allDay ? "23:59" : e.end, null))).length : 0;
+                return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 360, overflowY: "auto" }}>
                   <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>{form.entries.length} dni (max {MAX_SERIES_DATES}) — kliknij dzień, żeby zmienić dla niego godziny{form.type === "work" ? " i załogę" : ""}.</div>
+                  {conflictCount > 0 && (
+                    <div style={{ fontSize: 11.5, color: COLORS.rose, background: COLORS.rose + "15", border: `1px solid ${COLORS.rose}55`, borderRadius: 6, padding: "6px 8px", display: "flex", alignItems: "center", gap: 6 }}>
+                      <AlertTriangle size={12} /> {conflictCount} {conflictCount === 1 ? "dzień ma" : "dni ma"} konflikt terminu (zaznaczone na czerwono niżej) — rozwiń dzień, żeby wysłać zapytanie o akceptację albo wybrać inną osobę.
+                    </div>
+                  )}
                   {form.entries.map(e => {
                     const isOpen = expandedEntry === e.date;
-                    const crewNames = e.participantIds.map(id => profiles.find(p => p.id === id)?.name).filter(Boolean);
+                    const crew = e.participantIds.map(id => {
+                      const u = profiles.find(p => p.id === id);
+                      const busy = isUserBusy(id, e.date, e.allDay ? "00:00" : e.start, e.allDay ? "23:59" : e.end, null);
+                      return u ? { name: u.name, busy } : null;
+                    }).filter(Boolean);
+                    const hasConflict = crew.some(c => c.busy);
                     return (
-                      <div key={e.date} style={{ border: `1px solid ${COLORS.line}`, borderRadius: 8, background: COLORS.bg, overflow: "hidden" }}>
-                        <div onClick={() => setExpandedEntry(isOpen ? null : e.date)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", cursor: "pointer" }}>
-                          <span style={{ fontSize: 12.5, fontWeight: 600, flex: 1 }}>{e.date}</span>
+                      <div key={e.date} style={{ border: `1px solid ${hasConflict ? COLORS.rose : COLORS.line}`, borderRadius: 8, background: COLORS.bg, overflow: "hidden" }}>
+                        <div onClick={() => setExpandedEntry(isOpen ? null : e.date)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", cursor: "pointer", flexWrap: "wrap" }}>
+                          {hasConflict && <AlertTriangle size={13} color={COLORS.rose} />}
+                          <span style={{ fontSize: 12.5, fontWeight: 600 }}>{e.date}</span>
                           <span style={{ fontSize: 11, color: COLORS.textMuted }}>{e.allDay ? "Cały dzień" : `${e.start}–${e.end}`}</span>
-                          {form.type === "work" && crewNames.length > 0 && <span style={{ fontSize: 10.5, color: COLORS.teal }}>{crewNames.join(", ")}</span>}
-                          <Pencil size={12} color={COLORS.textMuted} />
+                          {form.type === "work" && crew.length > 0 && (
+                            <span style={{ fontSize: 10.5, marginLeft: "auto", marginRight: 4 }}>
+                              {crew.map((c, i) => (
+                                <span key={i} style={{ color: c.busy ? COLORS.rose : COLORS.teal }}>{i > 0 && ", "}{c.name}{c.busy ? " (zajęty/a)" : ""}</span>
+                              ))}
+                            </span>
+                          )}
+                          <Pencil size={12} color={COLORS.textMuted} style={{ marginLeft: form.type === "work" && crew.length > 0 ? 0 : "auto" }} />
                           <button onClick={(ev) => { ev.stopPropagation(); removeSeriesDay(e.date); }} style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.rose, display: "flex", padding: 0 }}><X size={13} /></button>
                         </div>
                         {isOpen && (
@@ -1314,7 +1361,8 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
                     );
                   })}
                 </div>
-              )}
+                );
+              })()}
             </div>
           </Field>
         )}
@@ -1607,8 +1655,9 @@ function ProfileView({ profile, onUpdate, onChangePassword }) {
 }
 
 // ================= ADMIN PANEL =================
-function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSendPasswordReset, onDeleteEvent, onEditEvent }) {
+function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSendPasswordReset, onDeleteEvent, onEditEvent, bufferMinutes, onSetBufferMinutes }) {
   const [tab, setTab] = useState("team");
+  const [bufferInput, setBufferInput] = useState(String(bufferMinutes));
   const pending = profiles.filter(p => !p.approved);
   const approved = profiles.filter(p => p.approved);
   const upcoming = events.slice().sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
@@ -1616,8 +1665,8 @@ function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSe
   return (
     <div style={{ maxWidth: 780 }}>
       <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: 18, marginBottom: 14 }}>Panel admina</div>
-      <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-        {[["team", `Zespół${pending.length ? ` (${pending.length} oczekuje)` : ""}`], ["events", "Wszystkie terminy"], ["activity", "Aktywność"]].map(([id, label]) => (
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+        {[["team", `Zespół${pending.length ? ` (${pending.length} oczekuje)` : ""}`], ["events", "Wszystkie terminy"], ["activity", "Aktywność"], ["settings", "Ustawienia"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} style={{ padding: "7px 12px", borderRadius: 8, border: `1px solid ${tab === id ? COLORS.amber : COLORS.line}`, background: tab === id ? COLORS.amber + "22" : "transparent", color: COLORS.text, fontSize: 12.5, cursor: "pointer" }}>{label}</button>
         ))}
       </div>
@@ -1688,6 +1737,23 @@ function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSe
                 <span style={{ flex: 1 }}>{a.details}</span>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {tab === "settings" && (
+        <div style={{ maxWidth: 420 }}>
+          <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Bufor czasowy między zadaniami</div>
+            <div style={{ fontSize: 12, color: COLORS.textMuted, lineHeight: 1.5 }}>
+              Minimalny odstęp (w minutach), jaki musi być między dwoma terminami tej samej osoby — np. czas potrzebny na dojazd z jednego zadania na drugie. Jeśli między dwoma terminami zostanie mniej niż ten czas, system uzna osobę za zajętą, nawet jeśli terminy się formalnie nie pokrywają.
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input type="number" min="0" step="15" value={bufferInput} onChange={e => setBufferInput(e.target.value)}
+                style={{ width: 100, padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: COLORS.bg, color: COLORS.text, fontSize: 13, outline: "none" }} />
+              <span style={{ fontSize: 12.5, color: COLORS.textMuted }}>minut (obecnie: {bufferMinutes} min = {(bufferMinutes / 60).toFixed(1).replace(/\.0$/, "")} godz.)</span>
+            </div>
+            <button onClick={() => onSetBufferMinutes(Math.max(0, parseInt(bufferInput, 10) || 0))} style={{ ...primaryBtnStyle(), alignSelf: "flex-start" }}>Zapisz</button>
           </div>
         </div>
       )}

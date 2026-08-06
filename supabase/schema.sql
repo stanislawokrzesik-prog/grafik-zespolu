@@ -205,6 +205,17 @@ create policy "push_sub_select" on public.push_subscriptions for select using (u
 create policy "push_sub_insert" on public.push_subscriptions for insert with check (user_id = auth.uid());
 create policy "push_sub_delete" on public.push_subscriptions for delete using (user_id = auth.uid());
 
+-- app_settings: pojedynczy wiersz ustawień zespołu (np. bufor czasowy na dojazd między zadaniami)
+create table if not exists public.app_settings (
+  id text primary key default 'default',
+  buffer_minutes int not null default 120,
+  updated_at timestamptz not null default now()
+);
+insert into public.app_settings (id, buffer_minutes) values ('default', 120) on conflict (id) do nothing;
+alter table public.app_settings enable row level security;
+create policy "app_settings_select" on public.app_settings for select using (auth.role() = 'authenticated');
+create policy "app_settings_update" on public.app_settings for update using (public.is_admin());
+
 -- ---------- REALTIME ----------
 -- Włącza natychmiastowe aktualizacje (bez tego trzeba by odpytywać bazę ręcznie)
 alter publication supabase_realtime add table public.profiles;
