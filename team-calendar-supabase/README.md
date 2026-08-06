@@ -1,0 +1,123 @@
+# Grafik zespołu — wdrożenie na Supabase + Netlify
+
+Ten folder to gotowy projekt (React + Vite). Zamiast pamięci artefaktu Claude używa prawdziwej bazy danych Supabase, prawdziwego logowania e-mail/hasło i aktualizacji na żywo (Realtime). Poniżej masz wszystko krok po kroku — nie musisz nic programować, tylko klikać i wklejać.
+
+---
+
+## Krok 1 — Załóż projekt w Supabase
+
+1. Wejdź na [supabase.com](https://supabase.com) → **New project**.
+2. Podaj nazwę (np. `grafik-zespolu`), hasło do bazy (zapisz je gdzieś) i region (najbliższy Wam, np. Frankfurt).
+3. Poczekaj ok. 2 minuty, aż projekt się utworzy.
+
+## Krok 2 — Wgraj schemat bazy danych
+
+1. W panelu Supabase po lewej: **SQL Editor** → **New query**.
+2. Otwórz plik `supabase/schema.sql` z tego projektu, skopiuj całą zawartość i wklej do edytora.
+3. Kliknij **Run**. Powinno pokazać "Success. No rows returned".
+
+To tworzy wszystkie tabele, zabezpieczenia (RLS) i włącza Realtime. Nie musisz nic w tym pliku rozumieć ani zmieniać.
+
+## Krok 3 — Skonfiguruj logowanie e-mail
+
+1. W panelu Supabase: **Authentication** → **Providers** → upewnij się, że **Email** jest włączony (jest domyślnie).
+2. **Authentication** → **URL Configuration** → w polu **Site URL** wpisz na razie `http://localhost:5173` (zmienimy to w Kroku 6, po wdrożeniu na Netlify).
+3. (Opcjonalnie, ale polecane) **Authentication** → **Providers** → **Email** → możesz wyłączyć "Confirm email", jeśli chcesz, żeby zespół mógł się logować od razu po rejestracji bez klikania w link potwierdzający w mailu. Dla testów z zaufanym, małym zespołem to wygodniejsze.
+
+## Krok 4 — Pobierz klucze API
+
+1. **Project Settings** (ikona zębatki) → **API**.
+2. Skopiuj **Project URL** oraz **anon public key** — będą potrzebne za chwilę.
+
+## Krok 5 — Wrzuć kod na GitHub
+
+Netlify wdraża najwygodniej z repozytorium GitHub.
+
+1. Załóż darmowe konto na [github.com](https://github.com), jeśli jeszcze nie masz.
+2. Stwórz nowe, **prywatne** repozytorium (np. `grafik-zespolu`).
+3. Wgraj do niego całą zawartość tego folderu (`team-calendar-supabase`) — najprościej przez przeciągnięcie plików w interfejsie GitHub ("uploading an existing file") albo przez `git`:
+   ```
+   cd team-calendar-supabase
+   git init
+   git add .
+   git commit -m "Grafik zespołu"
+   git branch -M main
+   git remote add origin https://github.com/TWOJ-LOGIN/grafik-zespolu.git
+   git push -u origin main
+   ```
+
+## Krok 6 — Wdróż na Netlify
+
+1. Wejdź na [app.netlify.com](https://app.netlify.com) → **Add new site** → **Import an existing project**.
+2. Wybierz GitHub, zaloguj się, wskaż repozytorium `grafik-zespolu`.
+3. Netlify sam wykryje `netlify.toml` (build command: `npm run build`, publish: `dist`) — nic nie zmieniaj.
+4. **Zanim klikniesz Deploy**, rozwiń **Environment variables** i dodaj dwie zmienne:
+   - `VITE_SUPABASE_URL` = (Project URL z Kroku 4)
+   - `VITE_SUPABASE_ANON_KEY` = (anon public key z Kroku 4)
+5. Kliknij **Deploy site**. Po 1–2 minutach dostaniesz link typu `https://coś-tam.netlify.app`.
+6. (Polecane) W **Site settings** → **Change site name** ustaw czytelniejszy adres, np. `grafik-nazwafirmy.netlify.app`.
+
+## Krok 7 — Dopnij adres w Supabase
+
+Wróć do Supabase → **Authentication** → **URL Configuration**:
+- **Site URL**: wklej swój adres z Netlify (np. `https://grafik-nazwafirmy.netlify.app`).
+- **Redirect URLs**: dodaj ten sam adres (dokładnie taki sam, bez `/` na końcu).
+
+Bez tego linki resetu hasła w mailach będą prowadzić donikąd.
+
+## Krok 8 — Pierwsze uruchomienie
+
+1. Wejdź na swój adres Netlify.
+2. Zarejestruj się jako pierwsza osoba — **automatycznie zostajesz administratorem** i masz od razu dostęp.
+3. Wyślij link do reszty zespołu (max 5 osób). Każda kolejna osoba po rejestracji czeka na Twoje zatwierdzenie w **Panel admina → Zespół**.
+
+---
+
+## Jak to teraz działa (różnice względem wersji testowej w Claude)
+
+- **Logowanie**: prawdziwy e-mail + hasło (Supabase Auth), zamiast imienia i PIN-u.
+- **"Nie pamiętam hasła"**: prawdziwy e-mail z linkiem resetującym, wysyłany automatycznie przez Supabase.
+- **Aktualizacje na żywo**: zmiany innych osób pojawiają się natychmiast (Supabase Realtime), bez odświeżania i bez czekania kilku sekund jak wcześniej.
+- **Dodawanie osób**: zamiast ręcznego dodawania przez admina — każdy się sam rejestruje, a Ty go zatwierdzasz jednym kliknięciem w Panelu admina.
+- **Usuwanie konta na stałe**: to jedyna czynność, której nie da się bezpiecznie zrobić z samej aplikacji (wymagałoby to trzymania w przeglądarce klucza dającego pełny dostęp do bazy, czego nie robimy ze względów bezpieczeństwa). "Zablokuj dostęp" w Panelu admina wystarcza w 99% przypadków — a pełne usunięcie konta robisz w Supabase → Authentication → Users → trzy kropki przy osobie → Delete.
+- **Reset hasła komuś innemu**: jako admin, przy każdej osobie w Panelu admina masz przycisk "Reset hasła" — wysyła jej e-mail z linkiem do ustawienia nowego hasła.
+
+## Bezpieczeństwo — uczciwie
+
+To rozwiązanie zabezpieczeń (RLS w bazie) jest dopasowane do małego, zaufanego zespołu do 5 osób: każda zatwierdzona osoba widzi terminy całego zespołu (to jest wręcz potrzebne, żeby wykrywać konflikty), ale każdy edytuje tylko swoje rzeczy, a admin może wszystko. Jeśli w przyszłości zespół urośnie albo dane będą bardziej wrażliwe, da się to dokręcić mocniej — daj znać.
+
+## Koszt
+
+Darmowy plan Supabase i darmowy plan Netlify w zupełności wystarczą na zespół do 5 osób — to nie jest coś, co przy tej skali zacznie kosztować.
+
+## Aktualizacja: prywatność terminów, log aktywności, instalacja jako aplikacja (PWA)
+
+Jeśli już wdrożyłeś wcześniejszą wersję, zrób to teraz:
+
+1. **Baza danych**: w Supabase → SQL Editor → wklej i uruchom `supabase/migration-privacy-audit.sql`. To dokłada: ukrywanie tytułu/lokalizacji/notatek terminu przed osobami, które nie są jego uczestnikami (widzą tylko że dana osoba jest zajęta, o określonych godzinach), oraz tabelę z logiem aktywności widoczną tylko dla admina (Panel admina → zakładka "Aktywność" — logowania, tworzenie/edycja/usuwanie terminów, zaproszenia, prośby o zmianę terminu, zmiany profilu, decyzje admina).
+2. **Kod**: podmień pliki `src/App.jsx`, `index.html`, `src/main.jsx` oraz dodaj nowe: `public/manifest.json`, `public/sw.js`, folder `public/icons/` (cztery pliki PNG) — na GitHubie przez "Add file → Upload files", przeciągając te pliki (zachowując strukturę folderów tak jak poprzednio).
+3. Po wgraniu na GitHub, Netlify sam zbuduje nową wersję (masz włączone ciągłe wdrażanie z GitHuba).
+
+**Instalacja na telefonie/komputerze:**
+- **Android (Chrome)** i **komputer (Chrome/Edge)**: w aplikacji pojawi się przycisk "Zainstaluj" w górnym pasku — wystarczy kliknąć. Można też użyć menu przeglądarki → "Zainstaluj aplikację" / "Dodaj do ekranu głównego".
+- **iPhone/iPad (Safari)**: Apple nie pozwala przeglądarce pokazać własnego przycisku instalacji — trzeba to zrobić ręcznie: otwórz stronę w Safari → przycisk "Udostępnij" (kwadrat ze strzałką) → **"Dodaj do ekranu początkowego"**.
+- Uwaga: to wciąż jest aplikacja internetowa działająca na żywo z bazą danych — instalacja daje wygodną ikonkę i pełnoekranowy widok bez paska adresu, ale do działania nadal potrzebne jest połączenie z internetem.
+
+## Aktualizacja: „cały dzień", urlop na kilka dni, cykliczna niedostępność
+
+1. **Baza danych**: Supabase → SQL Editor → wklej i uruchom `supabase/migration-allday-recurring.sql`.
+2. **Kod**: podmień `src/App.jsx` na GitHubie tak jak poprzednio (nadpisze poprzednią wersję), Netlify sam zbuduje nową wersję.
+
+**Co nowego:**
+- Przy dodawaniu „Mojej niedostępności" — checkbox **„Cały dzień"**, bez wpisywania godzin.
+- Checkbox **„Kilka dni / tygodni naraz"** — podajesz „Od" i „Do", jedno kliknięcie tworzy niedostępność (np. urlop) na każdy dzień w tym zakresie.
+- Nowy przycisk w pasku kalendarza: **„Cykliczna niedostępność"** — wybierasz dni tygodnia (np. wt, czw), godziny (albo cały dzień), datę startu i opcjonalnie datę końca (albo „bezterminowo"). System sam co tydzień pokazuje Cię jako zajętego/ą w te dni, bez ręcznego powtarzania. Regułami zarządzasz z tego samego okna (lista własnych reguł z opcją usunięcia).
+- Dla nieregularnych, pojedynczych dni (np. służba w straży w konkretnym dniu) — po prostu dodajesz każdy dzień osobno przez zwykłe „Nowy termin" → „Moja niedostępność" → „Cały dzień", albo zakresem, jeśli wypadają pod rząd.
+
+**Jedno ograniczenie, o którym warto wiedzieć:** jeśli ktoś wyśle prośbę o zmianę terminu do osoby zajętej z powodu reguły cyklicznej (a nie pojedynczego terminu), zaakceptowanie tej prośby dołączy tę osobę do nowego terminu, ale **nie wyłączy** automatycznie reguły cyklicznej na ten dzień — trzeba wtedy ręcznie dostosować regułę (np. zmienić jej daty), inaczej system znów pokaże tę osobę jako zajętą. To rzadki przypadek, ale wolę być szczery, że nie jest to jeszcze obsłużone automatycznie.
+
+
+## Wiele zespołów w jednej aplikacji?
+
+To jest możliwe (tzw. multi-tenancy), ale wymaga kolejnej, sporej przebudowy: dodania pojęcia "organizacji" (każdy profil, termin, powiadomienie przypisany do konkretnej firmy/zespołu), osobnych reguł dostępu tak, żeby zespół A w ogóle nie widział danych zespołu B, oraz decyzji, jak nowe organizacje miałyby powstawać (np. pierwsza osoba z nowej firmy zakłada organizację przy rejestracji zamiast dołączać do istniejącej). Jedna instalacja na Supabase/Netlify obsłużyłaby wtedy dowolną liczbę niezależnych zespołów. To osobny, zamknięty temat — daj znać, jeśli chcesz, żebym to zaprojektował i wdrożył.
+
