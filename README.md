@@ -103,6 +103,20 @@ Jeśli już wdrożyłeś wcześniejszą wersję, zrób to teraz:
 - **iPhone/iPad (Safari)**: Apple nie pozwala przeglądarce pokazać własnego przycisku instalacji — trzeba to zrobić ręcznie: otwórz stronę w Safari → przycisk "Udostępnij" (kwadrat ze strzałką) → **"Dodaj do ekranu początkowego"**.
 - Uwaga: to wciąż jest aplikacja internetowa działająca na żywo z bazą danych — instalacja daje wygodną ikonkę i pełnoekranowy widok bez paska adresu, ale do działania nadal potrzebne jest połączenie z internetem.
 
+## Aktualizacja: „cały dzień", urlop na kilka dni, cykliczna niedostępność
+
+1. **Baza danych**: Supabase → SQL Editor → wklej i uruchom `supabase/migration-allday-recurring.sql`.
+2. **Kod**: podmień `src/App.jsx` na GitHubie tak jak poprzednio (nadpisze poprzednią wersję), Netlify sam zbuduje nową wersję.
+
+**Co nowego:**
+- Przy dodawaniu „Mojej niedostępności" — checkbox **„Cały dzień"**, bez wpisywania godzin.
+- Checkbox **„Kilka dni / tygodni naraz"** — podajesz „Od" i „Do", jedno kliknięcie tworzy niedostępność (np. urlop) na każdy dzień w tym zakresie.
+- Nowy przycisk w pasku kalendarza: **„Cykliczna niedostępność"** — wybierasz dni tygodnia (np. wt, czw), godziny (albo cały dzień), datę startu i opcjonalnie datę końca (albo „bezterminowo"). System sam co tydzień pokazuje Cię jako zajętego/ą w te dni, bez ręcznego powtarzania. Regułami zarządzasz z tego samego okna (lista własnych reguł z opcją usunięcia).
+- Dla nieregularnych, pojedynczych dni (np. służba w straży w konkretnym dniu) — po prostu dodajesz każdy dzień osobno przez zwykłe „Nowy termin" → „Moja niedostępność" → „Cały dzień", albo zakresem, jeśli wypadają pod rząd.
+
+**Jedno ograniczenie, o którym warto wiedzieć:** jeśli ktoś wyśle prośbę o zmianę terminu do osoby zajętej z powodu reguły cyklicznej (a nie pojedynczego terminu), zaakceptowanie tej prośby dołączy tę osobę do nowego terminu, ale **nie wyłączy** automatycznie reguły cyklicznej na ten dzień — trzeba wtedy ręcznie dostosować regułę (np. zmienić jej daty), inaczej system znów pokaże tę osobę jako zajętą. To rzadki przypadek, ale wolę być szczery, że nie jest to jeszcze obsłużone automatycznie.
+
+
 ## Wiele zespołów w jednej aplikacji?
 
 To jest możliwe (tzw. multi-tenancy), ale wymaga kolejnej, sporej przebudowy: dodania pojęcia "organizacji" (każdy profil, termin, powiadomienie przypisany do konkretnej firmy/zespołu), osobnych reguł dostępu tak, żeby zespół A w ogóle nie widział danych zespołu B, oraz decyzji, jak nowe organizacje miałyby powstawać (np. pierwsza osoba z nowej firmy zakłada organizację przy rejestracji zamiast dołączać do istniejącej). Jedna instalacja na Supabase/Netlify obsłużyłaby wtedy dowolną liczbę niezależnych zespołów. To osobny, zamknięty temat — daj znać, jeśli chcesz, żebym to zaprojektował i wdrożył.

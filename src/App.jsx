@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Calendar as CalIcon, Bell, LogOut, Plus, Check, X, Clock,
   MapPin, Settings, AlertTriangle, Send, ChevronLeft, ChevronRight,
-  ShieldCheck, User as UserIcon, Trash2, Pencil, Ban, Loader2, Sun, Moon, Mail, KeyRound
+  ShieldCheck, User as UserIcon, Trash2, Pencil, Ban, Loader2, Sun, Moon, Mail, KeyRound, Repeat, CalendarDays
 } from "lucide-react";
 import { supabase } from "./supabaseClient.js";
 
@@ -66,10 +66,10 @@ async function fetchEvents(isAdmin) {
     .order("date", { ascending: true }).order("start_time", { ascending: true });
   if (error) throw error;
   const detailed = (data || []).map(e => ({
-    id: e.id, title: e.title, date: e.date, start: e.start_time, end: e.end_time,
+    id: e.id, title: e.title, date: e.date, start: e.start_time, end: e.end_time, allDay: e.all_day,
     location: e.location, notes: e.notes, type: e.type, ownerId: e.owner_id,
     participants: (e.event_participants || []).map(p => ({ userId: p.user_id, status: p.status })),
-    detailed: true,
+    detailed: true, recurring: false,
   }));
   if (isAdmin) return detailed; // admin already sees every row in full via RLS
 
@@ -82,10 +82,51 @@ async function fetchEvents(isAdmin) {
   const grouped = {};
   (busyRows || []).forEach(r => {
     if (detailedIds.has(r.event_id)) return;
-    if (!grouped[r.event_id]) grouped[r.event_id] = { id: r.event_id, date: r.date, start: r.start_time, end: r.end_time, ownerId: r.owner_id, title: null, location: null, notes: null, type: null, participants: [], detailed: false };
+    if (!grouped[r.event_id]) grouped[r.event_id] = { id: r.event_id, date: r.date, start: r.start_time, end: r.end_time, allDay: r.all_day, ownerId: r.owner_id, title: null, location: null, notes: null, type: null, participants: [], detailed: false, recurring: false };
     grouped[r.event_id].participants.push({ userId: r.user_id, status: r.status });
   });
   return [...detailed, ...Object.values(grouped)];
+}
+async function fetchRecurringBlocks(isAdmin) {
+  const { data, error } = await supabase.from("recurring_blocks").select("*");
+  if (error) throw error;
+  const detailed = (data || []).map(r => ({
+    id: r.id, userId: r.user_id, label: r.label, weekdays: r.weekdays, allDay: r.all_day,
+    start: r.start_time, end: r.end_time, dateFrom: r.date_from, dateUntil: r.date_until, detailed: true,
+  }));
+  if (isAdmin) return detailed;
+
+  const { data: busyRows, error: busyErr } = await supabase.from("recurring_busy_view").select("*");
+  if (busyErr) throw busyErr;
+  const detailedIds = new Set(detailed.map(r => r.id));
+  const minimal = (busyRows || []).filter(r => !detailedIds.has(r.id)).map(r => ({
+    id: r.id, userId: r.user_id, label: null, weekdays: r.weekdays, allDay: r.all_day,
+    start: r.start_time, end: r.end_time, dateFrom: r.date_from, dateUntil: r.date_until, detailed: false,
+  }));
+  return [...detailed, ...minimal];
+}
+// Turns recurring rules into virtual "events" for a bounded window, so the rest of
+// the app (conflict checks, calendar rendering) can treat them just like real events.
+function expandRecurringBlocks(rules, windowStartISO, windowEndISO) {
+  const out = [];
+  const winStart = new Date(windowStartISO), winEnd = new Date(windowEndISO);
+  rules.forEach(rule => {
+    const from = new Date(Math.max(new Date(rule.dateFrom), winStart));
+    const until = rule.dateUntil ? new Date(Math.min(new Date(rule.dateUntil), winEnd)) : winEnd;
+    if (from > until) return;
+    for (let d = new Date(from); d <= until; d.setDate(d.getDate() + 1)) {
+      const weekday = (d.getDay() + 6) % 7; // 0=Mon..6=Sun
+      if (!rule.weekdays.includes(weekday)) continue;
+      const iso = toISODate(d);
+      out.push({
+        id: `rec-${rule.id}-${iso}`, date: iso, start: rule.allDay ? "00:00" : rule.start, end: rule.allDay ? "23:59" : rule.end,
+        allDay: rule.allDay, ownerId: rule.userId, type: "block", title: rule.detailed ? (rule.label || "Niedostępność cykliczna") : null,
+        location: null, notes: null, participants: [{ userId: rule.userId, status: "accepted" }],
+        detailed: rule.detailed, recurring: true, recurringRuleId: rule.id,
+      });
+    }
+  });
+  return out;
 }
 async function fetchNotifications() {
   const { data, error } = await supabase.from("notifications").select("*").order("created_at", { ascending: false });
@@ -111,6 +152,7 @@ export default function App() {
 
   const [profiles, setProfiles] = useState([]);
   const [events, setEvents] = useState([]);
+  const [recurringBlocks, setRecurringBlocks] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [joinRequests, setJoinRequests] = useState([]);
   const [auditLog, setAuditLog] = useState([]);
@@ -123,6 +165,7 @@ export default function App() {
   const [showNewEvent, setShowNewEvent] = useState(null);
   const [showEditEvent, setShowEditEvent] = useState(null);
   const [showJoinReq, setShowJoinReq] = useState(null);
+  const [showRecurring, setShowRecurring] = useState(false);
 
   const [notifPermission, setNotifPermission] = useState(
     typeof window !== "undefined" && typeof window.Notification !== "undefined" ? window.Notification.permission : "unsupported"
@@ -172,8 +215,15 @@ export default function App() {
   const refreshAll = useCallback(async () => {
     try {
       const isAdmin = profile?.role === "admin";
-      const [p, e, n, j, a] = await Promise.all([fetchProfiles(), fetchEvents(isAdmin), fetchNotifications(), fetchJoinRequests(), isAdmin ? fetchAuditLog() : Promise.resolve([])]);
-      setProfiles(p); setEvents(e); setNotifications(n); setJoinRequests(j); setAuditLog(a);
+      const [p, e, n, j, a, rb] = await Promise.all([
+        fetchProfiles(), fetchEvents(isAdmin), fetchNotifications(), fetchJoinRequests(),
+        isAdmin ? fetchAuditLog() : Promise.resolve([]), fetchRecurringBlocks(isAdmin),
+      ]);
+      const windowStart = toISODate(addDays(new Date(), -30));
+      const windowEnd = toISODate(addDays(new Date(), 400));
+      const virtualEvents = expandRecurringBlocks(rb, windowStart, windowEnd);
+      setProfiles(p); setEvents([...e, ...virtualEvents]); setRecurringBlocks(rb);
+      setNotifications(n); setJoinRequests(j); setAuditLog(a);
     } catch (err) { console.error("Błąd wczytywania danych", err); }
   }, [profile?.role]);
 
@@ -189,6 +239,7 @@ export default function App() {
       .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, refreshAll)
       .on("postgres_changes", { event: "*", schema: "public", table: "join_requests" }, refreshAll)
       .on("postgres_changes", { event: "*", schema: "public", table: "audit_log" }, refreshAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "recurring_blocks" }, refreshAll)
       .subscribe();
     return () => { supabase.removeChannel(channel); };
   }, [profile, refreshAll]);
@@ -248,8 +299,11 @@ export default function App() {
 
   // ---------- mutations ----------
   async function createEvent(form) {
+    const isAllDay = form.type === "block" && form.allDay;
+    const startTime = isAllDay ? "00:00" : form.start;
+    const endTime = isAllDay ? "23:59" : form.end;
     const { data: ev, error } = await supabase.from("events").insert({
-      title: form.title, date: form.date, start_time: form.start, end_time: form.end,
+      title: form.title, date: form.date, start_time: startTime, end_time: endTime, all_day: isAllDay,
       location: form.location, notes: form.notes, type: form.type, owner_id: profile.id,
     }).select().single();
     if (error) { console.error(error); return; }
@@ -274,17 +328,58 @@ export default function App() {
         await pushNotification(uid, "join_request", buildJoinRequestText(profile.name, conflict, { ...ev, start: form.start, end: form.end }, form.joinMessage), { requestId: jr.id });
       }
     }
-    await logAction("event_created", `${profile.name} utworzył(a) termin „${form.title}” (${form.date} ${form.start}–${form.end}).`);
+    await logAction("event_created", `${profile.name} utworzył(a) termin „${form.title}” (${form.date} ${isAllDay ? "cały dzień" : `${startTime}–${endTime}`}).`);
     setShowNewEvent(null);
     refreshAll();
   }
 
+  // "Urlop / kilka dni": tworzy niedostępność (blok) na każdy dzień w podanym zakresie dat
+  async function createBlockRange(form) {
+    const isAllDay = form.allDay;
+    const startTime = isAllDay ? "00:00" : form.start;
+    const endTime = isAllDay ? "23:59" : form.end;
+    const dates = [];
+    for (let d = new Date(form.dateFrom); d <= new Date(form.dateTo); d.setDate(d.getDate() + 1)) dates.push(toISODate(d));
+    if (dates.length === 0) return;
+    const rows = dates.map(date => ({
+      title: form.title || "Niedostępny/a", date, start_time: startTime, end_time: endTime, all_day: isAllDay,
+      location: null, notes: form.notes || null, type: "block", owner_id: profile.id,
+    }));
+    const { data: inserted, error } = await supabase.from("events").insert(rows).select();
+    if (error) { console.error(error); return; }
+    await supabase.from("event_participants").insert(inserted.map(ev => ({ event_id: ev.id, user_id: profile.id, status: "accepted" })));
+    await logAction("event_created", `${profile.name} dodał(a) niedostępność „${form.title || "Niedostępny/a"}” na ${dates.length} dni (${dates[0]}–${dates[dates.length - 1]}).`);
+    setShowNewEvent(null);
+    refreshAll();
+  }
+
+  async function createRecurringBlock(form) {
+    const isAllDay = form.allDay;
+    const { error } = await supabase.from("recurring_blocks").insert({
+      user_id: profile.id, label: form.label || "Niedostępny/a", weekdays: form.weekdays,
+      all_day: isAllDay, start_time: isAllDay ? null : form.start, end_time: isAllDay ? null : form.end,
+      date_from: form.dateFrom, date_until: form.dateUntil || null,
+    });
+    if (error) { console.error(error); return; }
+    await logAction("recurring_created", `${profile.name} dodał(a) cykliczną niedostępność „${form.label || "Niedostępny/a"}”.`);
+    setShowRecurring(false);
+    refreshAll();
+  }
+  async function deleteRecurringBlock(rule) {
+    await supabase.from("recurring_blocks").delete().eq("id", rule.id);
+    await logAction("recurring_deleted", `${profile.name} usunął(-ęła) cykliczną niedostępność${rule.label ? ` „${rule.label}”` : ""}.`);
+    refreshAll();
+  }
+
   async function updateEvent(updated) {
+    const isAllDay = updated.type === "block" && updated.allDay;
+    const startTime = isAllDay ? "00:00" : updated.start;
+    const endTime = isAllDay ? "23:59" : updated.end;
     await supabase.from("events").update({
-      title: updated.title, date: updated.date, start_time: updated.start, end_time: updated.end,
+      title: updated.title, date: updated.date, start_time: startTime, end_time: endTime, all_day: isAllDay,
       location: updated.location, notes: updated.notes, type: updated.type,
     }).eq("id", updated.id);
-    await logAction("event_updated", `${profile.name} zmodyfikował(a) termin „${updated.title}” (${updated.date} ${updated.start}–${updated.end}).`);
+    await logAction("event_updated", `${profile.name} zmodyfikował(a) termin „${updated.title}” (${updated.date} ${isAllDay ? "cały dzień" : `${startTime}–${endTime}`}).`);
     setShowEditEvent(null);
     refreshAll();
   }
@@ -401,6 +496,7 @@ export default function App() {
             filterUserIds={filterUserIds} setFilterUserIds={setFilterUserIds}
             onNewEvent={(date) => setShowNewEvent({ date })}
             onEditEvent={(ev) => setShowEditEvent(ev)}
+            onOpenRecurring={() => setShowRecurring(true)}
           />
         )}
         {view === "notifications" && (
@@ -425,15 +521,20 @@ export default function App() {
       {showNewEvent && (
         <EventModal mode="new" profiles={profiles} profile={profile} defaultDate={showNewEvent.date}
           onClose={() => setShowNewEvent(null)} isUserBusy={isUserBusy} conflictEventFor={conflictEventFor}
-          onSubmit={createEvent} />
+          onSubmit={createEvent} onSubmitRange={createBlockRange} />
       )}
       {showEditEvent && (
         <EventModal mode="edit" profiles={profiles} profile={profile} existing={showEditEvent}
           onClose={() => setShowEditEvent(null)} isUserBusy={isUserBusy} conflictEventFor={conflictEventFor}
           onSubmit={updateEvent} onDelete={deleteEvent} onInviteUser={inviteToExistingEvent}
+          onDeleteRecurring={deleteRecurringBlock}
           onRequestJoin={(busyUserId, conflictEvent, draftEvent) => setShowJoinReq({ busyUserId, conflictEvent, draftEvent })} />
       )}
       {showJoinReq && <JoinRequestModal profiles={profiles} data={showJoinReq} onClose={() => setShowJoinReq(null)} onSend={sendJoinRequest} />}
+      {showRecurring && (
+        <RecurringBlockModal profile={profile} recurringBlocks={recurringBlocks}
+          onClose={() => setShowRecurring(false)} onCreate={createRecurringBlock} onDelete={deleteRecurringBlock} />
+      )}
     </div>
   );
 }
@@ -618,7 +719,7 @@ function TopNav({ profile, view, setView, unreadCount, pendingCount, onLogout, o
 }
 
 // ================= CALENDAR =================
-function CalendarView({ profiles, events, profile, calView, setCalView, anchorDate, setAnchorDate, filterUserIds, setFilterUserIds, onNewEvent, onEditEvent }) {
+function CalendarView({ profiles, events, profile, calView, setCalView, anchorDate, setAnchorDate, filterUserIds, setFilterUserIds, onNewEvent, onEditEvent, onOpenRecurring }) {
   const activeFilter = filterUserIds || profiles.map(u => u.id);
 
   function nav(dir) {
@@ -668,6 +769,9 @@ function CalendarView({ profiles, events, profile, calView, setCalView, anchorDa
         </div>
         <button onClick={() => onNewEvent(toISODate(calView === "day" ? anchorDate : new Date()))} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9, border: "none", background: COLORS.amber, color: "#12141C", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
           <Plus size={15} /> Nowy termin
+        </button>
+        <button onClick={onOpenRecurring} title="Cykliczna niedostępność (np. co wtorek/czwartek w godzinach pracy dla innej firmy)" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.textMuted, fontWeight: 500, fontSize: 12.5, cursor: "pointer" }}>
+          <Repeat size={14} /> Cykliczna niedostępność
         </button>
       </div>
 
@@ -752,7 +856,7 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
                   <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }}>
                     {dayEvents.slice(0, 3).map(ev => (
                       <div key={ev.id} style={{ fontSize: 10, borderRadius: 4, padding: "1px 4px", background: COLORS.bg, color: ev.detailed ? COLORS.text : COLORS.textMuted, borderLeft: `2px solid ${userColor(ev.ownerId, profiles)}`, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {ev.start} {ev.detailed ? (ev.title || "") : "Zajęty/a"}
+                        {ev.allDay ? "Cały dzień" : ev.start} {ev.detailed ? (ev.title || "") : "Zajęty/a"}
                       </div>
                     ))}
                     {dayEvents.length > 3 && <div style={{ fontSize: 9.5, color: COLORS.textMuted }}>+{dayEvents.length - 3} więcej</div>}
@@ -807,10 +911,11 @@ function YearView({ anchorDate, eventsForDay, onMonthClick, onDayClick }) {
 function EventCard({ ev, profiles, onClick }) {
   const ownerColor = userColor(ev.ownerId, profiles);
   const isBlock = ev.type === "block";
+  const timeLabel = ev.allDay ? "Cały dzień" : `${ev.start}–${ev.end}`;
   if (!ev.detailed) {
     return (
       <div title="Zajęty/a — szczegóły widzi tylko właściciel terminu i admin" style={{ borderRadius: 8, padding: "7px 9px", background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderLeftWidth: 3, borderLeftColor: ownerColor, opacity: 0.85 }}>
-        <div style={{ fontSize: 11, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {ev.start}–{ev.end}</div>
+        <div style={{ fontSize: 11, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {timeLabel} {ev.recurring && <Repeat size={10} />}</div>
         <div style={{ fontSize: 12.5, fontWeight: 600, margin: "2px 0", color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 5 }}><Ban size={11} /> Zajęty/a</div>
         <div style={{ display: "flex", gap: 3, marginTop: 5, flexWrap: "wrap" }}>
           {ev.participants.filter(p => p.status !== "declined").map(p => (
@@ -822,7 +927,7 @@ function EventCard({ ev, profiles, onClick }) {
   }
   return (
     <div onClick={onClick} style={{ cursor: "pointer", borderRadius: 8, padding: "7px 9px", background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderLeftWidth: 3, borderLeftColor: ownerColor }}>
-      <div style={{ fontSize: 11, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {ev.start}–{ev.end}</div>
+      <div style={{ fontSize: 11, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {timeLabel} {ev.recurring && <Repeat size={10} />}</div>
       <div style={{ fontSize: 12.5, fontWeight: 600, margin: "2px 0", color: isBlock ? COLORS.textMuted : COLORS.text, fontStyle: isBlock ? "italic" : "normal" }}>{isBlock ? "🚫 " : ""}{ev.title}</div>
       {ev.location && <div style={{ fontSize: 10.5, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 3 }}><MapPin size={9} /> {ev.location}</div>}
       {!isBlock && (
@@ -837,12 +942,35 @@ function EventCard({ ev, profiles, onClick }) {
 }
 
 // ================= EVENT MODAL =================
-function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, onSubmit, onDelete, isUserBusy, conflictEventFor, onInviteUser, onRequestJoin }) {
+function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, onSubmit, onSubmitRange, onDelete, isUserBusy, conflictEventFor, onInviteUser, onRequestJoin, onDeleteRecurring }) {
   const [form, setForm] = useState(() => existing ? {
-    title: existing.title, date: existing.date, start: existing.start, end: existing.end,
-    location: existing.location || "", notes: existing.notes || "", type: existing.type,
+    title: existing.title, date: existing.date, start: existing.start, end: existing.end, allDay: !!existing.allDay,
+    location: existing.location || "", notes: existing.notes || "", type: existing.type, rangeMode: false, dateTo: existing.date,
     participantIds: [], pendingJoinUserIds: [], joinMessage: "",
-  } : { title: "", date: defaultDate, start: "09:00", end: "10:00", location: "", notes: "", type: "work", participantIds: [], pendingJoinUserIds: [], joinMessage: "" });
+  } : { title: "", date: defaultDate, dateTo: defaultDate, start: "09:00", end: "10:00", allDay: false, rangeMode: false, location: "", notes: "", type: "work", participantIds: [], pendingJoinUserIds: [], joinMessage: "" });
+
+  // Read-only view for a single occurrence of a recurring unavailability rule —
+  // editing one occurrence isn't supported; the whole rule is managed from
+  // "Cykliczna niedostępność" instead.
+  if (existing && existing.recurring) {
+    const canManage = profile.role === "admin" || existing.ownerId === profile.id;
+    return (
+      <ModalShell onClose={onClose} title="Cykliczna niedostępność">
+        <div style={{ fontSize: 13, color: COLORS.textMuted, lineHeight: 1.6, marginBottom: 14 }}>
+          To wystąpienie cyklicznej reguły{existing.detailed && existing.title ? ` „${existing.title}”` : ""} — {existing.date}, {existing.allDay ? "cały dzień" : `${existing.start}–${existing.end}`}.
+          Pojedynczych wystąpień nie da się edytować — regułą zarządzasz w całości.
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          {canManage && (
+            <button onClick={() => { onDeleteRecurring({ id: existing.recurringRuleId, label: existing.title }); onClose(); }} style={{ ...secondaryBtnStyle(), color: COLORS.rose, borderColor: COLORS.rose }}>
+              <Trash2 size={14} /> Usuń całą regułę
+            </button>
+          )}
+          <button onClick={onClose} style={{ ...secondaryBtnStyle(), marginLeft: "auto" }}>Zamknij</button>
+        </div>
+      </ModalShell>
+    );
+  }
 
   const canEdit = mode === "new" || profile.role === "admin" || (existing && existing.ownerId === profile.id);
   const others = profiles.filter(u => u.id !== profile.id);
@@ -852,9 +980,16 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
   function busyCheck(uid) { return isUserBusy(uid, form.date, form.start, form.end, existing ? existing.id : null); }
 
   function submit() {
-    if (!form.title.trim() || !form.date || !form.start || !form.end) return;
-    if (existing) onSubmit({ ...existing, ...form });
-    else onSubmit(form);
+    if (form.type === "block" && form.rangeMode) {
+      if (!form.date || !form.dateTo || (!form.allDay && (!form.start || !form.end))) return;
+      onSubmitRange({ title: form.title, dateFrom: form.date, dateTo: form.dateTo, allDay: form.allDay, start: form.start, end: form.end, notes: form.notes });
+      return;
+    }
+    if (!form.title.trim() && !(form.type === "block")) return;
+    if (!form.date || (!form.allDay && (!form.start || !form.end))) return;
+    const payload = { ...form, title: form.title.trim() || (form.type === "block" ? "Niedostępny/a" : form.title) };
+    if (existing) onSubmit({ ...existing, ...payload });
+    else onSubmit(payload);
   }
 
   return (
@@ -862,16 +997,46 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <Field label="Rodzaj">
           <div style={{ display: "flex", gap: 8 }}>
-            <ChoiceBtn active={form.type === "work"} onClick={() => setForm(f => ({ ...f, type: "work" }))} disabled={!canEdit}>Wspólna praca</ChoiceBtn>
+            <ChoiceBtn active={form.type === "work"} onClick={() => setForm(f => ({ ...f, type: "work", rangeMode: false }))} disabled={!canEdit}>Wspólna praca</ChoiceBtn>
             <ChoiceBtn active={form.type === "block"} onClick={() => setForm(f => ({ ...f, type: "block", participantIds: [] }))} disabled={!canEdit}>Moja niedostępność</ChoiceBtn>
           </div>
         </Field>
-        <Field label="Tytuł"><Input value={form.title} onChange={v => setForm(f => ({ ...f, title: v }))} disabled={!canEdit} placeholder="np. Instalacja u klienta X" /></Field>
-        <div style={{ display: "flex", gap: 8 }}>
-          <Field label="Data" style={{ flex: 1 }}><Input type="date" value={form.date} onChange={v => setForm(f => ({ ...f, date: v }))} disabled={!canEdit} /></Field>
-          <Field label="Od" style={{ flex: 1 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} disabled={!canEdit} /></Field>
-          <Field label="Do" style={{ flex: 1 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} disabled={!canEdit} /></Field>
+
+        <Field label={form.type === "block" ? "Tytuł (np. Urlop, Zwolnienie)" : "Tytuł"}>
+          <Input value={form.title} onChange={v => setForm(f => ({ ...f, title: v }))} disabled={!canEdit} placeholder={form.type === "block" ? "np. Urlop" : "np. Instalacja u klienta X"} />
+        </Field>
+
+        {form.type === "block" && mode === "new" && (
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.text, cursor: "pointer" }}>
+            <input type="checkbox" checked={form.rangeMode} onChange={e => setForm(f => ({ ...f, rangeMode: e.target.checked, dateTo: f.date }))} disabled={!canEdit} />
+            Kilka dni / tygodni naraz (np. urlop)
+          </label>
+        )}
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Field label={form.rangeMode ? "Od (data)" : "Data"} style={{ flex: 1, minWidth: 120 }}>
+            <Input type="date" value={form.date} onChange={v => setForm(f => ({ ...f, date: v, dateTo: f.rangeMode && f.dateTo < v ? v : f.dateTo }))} disabled={!canEdit} />
+          </Field>
+          {form.type === "block" && form.rangeMode && (
+            <Field label="Do (data)" style={{ flex: 1, minWidth: 120 }}>
+              <Input type="date" value={form.dateTo} onChange={v => setForm(f => ({ ...f, dateTo: v }))} disabled={!canEdit} />
+            </Field>
+          )}
+          {!form.allDay && (
+            <>
+              <Field label="Od" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} disabled={!canEdit} /></Field>
+              <Field label="Do" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} disabled={!canEdit} /></Field>
+            </>
+          )}
         </div>
+
+        {form.type === "block" && (
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.text, cursor: "pointer" }}>
+            <input type="checkbox" checked={form.allDay} onChange={e => setForm(f => ({ ...f, allDay: e.target.checked }))} disabled={!canEdit} />
+            Cały dzień (bez podawania godzin)
+          </label>
+        )}
+
         {form.type === "work" && <Field label="Lokalizacja"><Input value={form.location} onChange={v => setForm(f => ({ ...f, location: v }))} disabled={!canEdit} placeholder="adres / miejsce" /></Field>}
         <Field label="Notatki"><Input value={form.notes} onChange={v => setForm(f => ({ ...f, notes: v }))} disabled={!canEdit} placeholder="opcjonalnie" /></Field>
 
@@ -938,7 +1103,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
         )}
 
         <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-          {canEdit && <button onClick={submit} style={primaryBtnStyle()}>{mode === "new" ? "Utwórz termin" : "Zapisz zmiany"}</button>}
+          {canEdit && <button onClick={submit} style={primaryBtnStyle()}>{mode === "new" ? (form.type === "block" && form.rangeMode ? "Dodaj niedostępność" : "Utwórz termin") : "Zapisz zmiany"}</button>}
           {existing && (profile.role === "admin" || existing.ownerId === profile.id) && (
             <button onClick={() => onDelete(existing)} style={{ ...secondaryBtnStyle(), color: COLORS.rose, borderColor: COLORS.rose }}><Trash2 size={14} /> Usuń</button>
           )}
@@ -975,6 +1140,87 @@ function ModalShell({ onClose, title, children }) {
 }
 
 // ================= JOIN REQUEST MODAL =================
+const WEEKDAY_SHORT = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Nie"];
+
+function RecurringBlockModal({ profile, recurringBlocks, onClose, onCreate, onDelete }) {
+  const [label, setLabel] = useState("");
+  const [weekdays, setWeekdays] = useState([]);
+  const [allDay, setAllDay] = useState(false);
+  const [start, setStart] = useState("08:00");
+  const [end, setEnd] = useState("16:00");
+  const [dateFrom, setDateFrom] = useState(toISODate(new Date()));
+  const [noEnd, setNoEnd] = useState(true);
+  const [dateUntil, setDateUntil] = useState("");
+
+  const mine = recurringBlocks.filter(r => r.userId === profile.id);
+
+  function toggleWeekday(i) { setWeekdays(w => w.includes(i) ? w.filter(x => x !== i) : [...w, i].sort()); }
+
+  function submit() {
+    if (weekdays.length === 0 || !dateFrom || (!allDay && (!start || !end))) return;
+    onCreate({ label: label.trim() || "Niedostępny/a", weekdays, allDay, start, end, dateFrom, dateUntil: noEnd ? null : dateUntil });
+    setLabel(""); setWeekdays([]);
+  }
+
+  return (
+    <ModalShell onClose={onClose} title="Cykliczna niedostępność">
+      <div style={{ fontSize: 12.5, color: COLORS.textMuted, marginBottom: 12, lineHeight: 1.5 }}>
+        Przykład: pracujesz dla innej firmy w każdy wtorek i czwartek 8:00–16:00 — zaznacz te dni, podaj godziny, a system co tydzień sam pokaże Cię jako zajętego/ą w tym oknie, bez ręcznego dodawania.
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <Field label="Nazwa (widoczna tylko dla Ciebie i admina)"><Input value={label} onChange={setLabel} placeholder="np. Praca w innej firmie / Straż" /></Field>
+        <Field label="Dni tygodnia">
+          <div style={{ display: "flex", gap: 5 }}>
+            {WEEKDAY_SHORT.map((d, i) => (
+              <button key={i} onClick={() => toggleWeekday(i)} style={{ flex: 1, padding: "7px 0", borderRadius: 7, fontSize: 11.5, cursor: "pointer", border: `1px solid ${weekdays.includes(i) ? COLORS.amber : COLORS.line}`, background: weekdays.includes(i) ? COLORS.amber + "22" : "transparent", color: weekdays.includes(i) ? COLORS.text : COLORS.textMuted }}>{d}</button>
+            ))}
+          </div>
+        </Field>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, cursor: "pointer" }}>
+          <input type="checkbox" checked={allDay} onChange={e => setAllDay(e.target.checked)} /> Cały dzień
+        </label>
+        {!allDay && (
+          <div style={{ display: "flex", gap: 8 }}>
+            <Field label="Od" style={{ flex: 1 }}><Input type="time" value={start} onChange={setStart} /></Field>
+            <Field label="Do" style={{ flex: 1 }}><Input type="time" value={end} onChange={setEnd} /></Field>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8 }}>
+          <Field label="Obowiązuje od" style={{ flex: 1 }}><Input type="date" value={dateFrom} onChange={setDateFrom} /></Field>
+          <Field label="Do kiedy" style={{ flex: 1 }}>
+            {noEnd ? <div style={{ fontSize: 12, color: COLORS.textMuted, padding: "8px 0" }}>Bezterminowo</div> : <Input type="date" value={dateUntil} onChange={setDateUntil} />}
+          </Field>
+        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, cursor: "pointer" }}>
+          <input type="checkbox" checked={noEnd} onChange={e => setNoEnd(e.target.checked)} /> Bezterminowo (do odwołania)
+        </label>
+
+        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <button onClick={submit} style={primaryBtnStyle()}>Dodaj regułę</button>
+          <button onClick={onClose} style={{ ...secondaryBtnStyle(), marginLeft: "auto" }}>Zamknij</button>
+        </div>
+
+        {mine.length > 0 && (
+          <div style={{ marginTop: 8, borderTop: `1px solid ${COLORS.line}`, paddingTop: 10 }}>
+            <div style={{ fontSize: 11.5, color: COLORS.textMuted, marginBottom: 6 }}>Twoje aktywne reguły</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {mine.map(r => (
+                <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 8, background: COLORS.bg, border: `1px solid ${COLORS.line}`, fontSize: 12 }}>
+                  <span style={{ flex: 1 }}>
+                    {r.label} — {r.weekdays.map(w => WEEKDAY_SHORT[w]).join(", ")}, {r.allDay ? "cały dzień" : `${r.start}–${r.end}`}
+                    <span style={{ color: COLORS.textMuted }}> (od {r.dateFrom}{r.dateUntil ? ` do ${r.dateUntil}` : ", bezterminowo"})</span>
+                  </span>
+                  <button onClick={() => onDelete(r)} style={{ background: "none", border: "none", cursor: "pointer", display: "flex" }}><Trash2 size={13} color={COLORS.rose} /></button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </ModalShell>
+  );
+}
+
 function JoinRequestModal({ profiles, data, onClose, onSend }) {
   const [message, setMessage] = useState("");
   const busyUser = profiles.find(u => u.id === data.busyUserId);
@@ -1170,6 +1416,7 @@ const ACTIVITY_LABELS = {
   invite_sent: "Zaproszenie", invite_accepted: "Akceptacja", invite_declined: "Odrzucenie",
   join_request_sent: "Prośba o zmianę", join_request_accepted: "Zmiana terminu", join_request_declined: "Odrzucenie prośby",
   profile_updated: "Profil", password_changed: "Zmiana hasła", user_approved: "Zatwierdzenie", user_blocked: "Blokada", role_changed: "Zmiana roli",
+  recurring_created: "Reguła cykliczna", recurring_deleted: "Usunięcie reguły",
 };
 function ActivityBadge({ action }) {
   return <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 20, border: `1px solid ${COLORS.line}`, color: COLORS.textMuted, flexShrink: 0, whiteSpace: "nowrap" }}>{ACTIVITY_LABELS[action] || action}</span>;
