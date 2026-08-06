@@ -191,6 +191,20 @@ select id, user_id, weekdays, all_day, start_time, end_time, date_from, date_unt
 from public.recurring_blocks;
 grant select on public.recurring_busy_view to authenticated;
 
+-- push_subscriptions: subskrypcje prawdziwych powiadomień push (na telefon/komputer)
+create table if not exists public.push_subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  endpoint text not null unique,
+  p256dh text not null,
+  auth text not null,
+  created_at timestamptz not null default now()
+);
+alter table public.push_subscriptions enable row level security;
+create policy "push_sub_select" on public.push_subscriptions for select using (user_id = auth.uid() or public.is_admin());
+create policy "push_sub_insert" on public.push_subscriptions for insert with check (user_id = auth.uid());
+create policy "push_sub_delete" on public.push_subscriptions for delete using (user_id = auth.uid());
+
 -- ---------- REALTIME ----------
 -- Włącza natychmiastowe aktualizacje (bez tego trzeba by odpytywać bazę ręcznie)
 alter publication supabase_realtime add table public.profiles;

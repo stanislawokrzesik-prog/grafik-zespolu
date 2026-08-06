@@ -21,10 +21,25 @@ const COLORS = { ...DARK_THEME };
 function applyTheme(theme) { Object.assign(COLORS, theme === "light" ? LIGHT_THEME : DARK_THEME); }
 const USER_PALETTE = ["#E8A33D", "#3FA796", "#8C8CE0", "#E8637A", "#5DBEE8"];
 const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');`;
+const RESPONSIVE_CSS = `
+.week-grid { display:grid; grid-template-columns: repeat(7, minmax(140px, 1fr)); gap:10px; overflow-x:auto; }
+@media (max-width: 700px) {
+  .week-grid { grid-template-columns: 1fr; overflow-x: visible; gap:8px; }
+}
+`;
+const GLOBAL_STYLE = FONT_IMPORT + RESPONSIVE_CSS;
 
 // ---------- date helpers ----------
 function pad(n) { return String(n).padStart(2, "0"); }
 function toISODate(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  const output = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) output[i] = rawData.charCodeAt(i);
+  return output;
+}
 function startOfWeek(d) { const date = new Date(d); const day = (date.getDay() + 6) % 7; date.setDate(date.getDate() - day); date.setHours(0, 0, 0, 0); return date; }
 function addDays(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
 function addMonths(d, n) { const r = new Date(d); r.setDate(1); r.setMonth(r.getMonth() + n); return r; }
@@ -253,7 +268,7 @@ export default function App() {
       if (!seenNotifIds.current.has(n.id)) {
         seenNotifIds.current.add(n.id);
         if (notifPermission === "granted" && typeof window !== "undefined" && typeof window.Notification !== "undefined") {
-          try { new window.Notification("Grafik zespołu", { body: n.message }); } catch (e) {}
+          try { new window.Notification("Grafik zespołu", { body: n.message, tag: n.id, icon: "/icons/icon-192.png" }); } catch (e) {}
         }
       }
     });
@@ -261,8 +276,37 @@ export default function App() {
 
   async function requestNotifPermission() {
     if (typeof window === "undefined" || typeof window.Notification === "undefined") { setNotifPermission("unsupported"); return; }
-    try { setNotifPermission(await window.Notification.requestPermission()); } catch (e) { setNotifPermission("denied"); }
+    try {
+      const perm = await window.Notification.requestPermission();
+      setNotifPermission(perm);
+      if (perm === "granted") await subscribeToPush();
+    } catch (e) { setNotifPermission("denied"); }
   }
+
+  async function subscribeToPush() {
+    if (typeof navigator === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) return;
+    const vapidKey = import.meta.env.VITE_VAPID_PUBLIC_KEY;
+    if (!vapidKey) { console.warn("Brak VITE_VAPID_PUBLIC_KEY — prawdziwe powiadomienia push są wyłączone (działają tylko powiadomienia w otwartej karcie)."); return; }
+    if (!profile) return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(vapidKey) });
+      const json = sub.toJSON();
+      await supabase.from("push_subscriptions").upsert(
+        { user_id: profile.id, endpoint: json.endpoint, p256dh: json.keys.p256dh, auth: json.keys.auth },
+        { onConflict: "endpoint" }
+      );
+    } catch (e) { console.warn("Rejestracja subskrypcji push nie powiodła się", e); }
+  }
+  const pushSubscribedRef = useRef(false);
+  useEffect(() => {
+    if (profile && profile.approved && notifPermission === "granted" && !pushSubscribedRef.current) {
+      pushSubscribedRef.current = true;
+      subscribeToPush();
+    }
+    if (!profile) pushSubscribedRef.current = false;
+  }, [profile, notifPermission]); // eslint-disable-line
 
   function isUserBusy(userId, date, start, end, excludeEventId) {
     return events.some(ev => {
@@ -299,7 +343,7 @@ export default function App() {
 
   // ---------- mutations ----------
   async function createEvent(form) {
-    const isAllDay = form.type === "block" && form.allDay;
+    const isAllDay = form.allDay;
     const startTime = isAllDay ? "00:00" : form.start;
     const endTime = isAllDay ? "23:59" : form.end;
     const { data: ev, error } = await supabase.from("events").insert({
@@ -334,23 +378,43 @@ export default function App() {
   }
 
   // "Urlop / kilka dni": tworzy niedostępność (blok) na każdy dzień w podanym zakresie dat
-  async function createBlockRange(form) {
+  // "Seria dat": dowolny, niekoniecznie ciągły zestaw dni (np. urlop, zlecenie na kilka
+  // rozstrzelonych dni, albo wspólna praca powtarzająca się przez kilka tygodni).
+  // Działa dla obu rodzajów terminu — "Moja niedostępność" i "Wspólna praca".
+  async function createEventSeries(form) {
     const isAllDay = form.allDay;
     const startTime = isAllDay ? "00:00" : form.start;
     const endTime = isAllDay ? "23:59" : form.end;
-    const dates = [];
-    for (let d = new Date(form.dateFrom); d <= new Date(form.dateTo); d.setDate(d.getDate() + 1)) dates.push(toISODate(d));
-    if (dates.length === 0) return;
+    const dates = [...new Set(form.dates)].sort();
+    if (dates.length === 0) return { ok: false, error: "Dodaj co najmniej jeden dzień." };
+
     const rows = dates.map(date => ({
-      title: form.title || "Niedostępny/a", date, start_time: startTime, end_time: endTime, all_day: isAllDay,
-      location: null, notes: form.notes || null, type: "block", owner_id: profile.id,
+      title: form.title || (form.type === "block" ? "Niedostępny/a" : ""), date, start_time: startTime, end_time: endTime, all_day: isAllDay,
+      location: form.type === "work" ? (form.location || null) : null, notes: form.notes || null, type: form.type, owner_id: profile.id,
     }));
     const { data: inserted, error } = await supabase.from("events").insert(rows).select();
-    if (error) { console.error(error); return; }
-    await supabase.from("event_participants").insert(inserted.map(ev => ({ event_id: ev.id, user_id: profile.id, status: "accepted" })));
-    await logAction("event_created", `${profile.name} dodał(a) niedostępność „${form.title || "Niedostępny/a"}” na ${dates.length} dni (${dates[0]}–${dates[dates.length - 1]}).`);
-    setShowNewEvent(null);
+    if (error) { console.error(error); return { ok: false, error: error.message }; }
+
+    const participantRows = inserted.map(ev => ({ event_id: ev.id, user_id: profile.id, status: "accepted" }));
+    const notifRows = [];
+    let skipped = 0;
+    if (form.type === "work") {
+      inserted.forEach(ev => {
+        (form.participantIds || []).forEach(pid => {
+          if (pid === profile.id) return;
+          const busy = isUserBusy(pid, ev.date, startTime, endTime, null);
+          if (busy) { skipped++; return; }
+          participantRows.push({ event_id: ev.id, user_id: pid, status: "pending" });
+          notifRows.push({ user_id: pid, type: "invite", message: `${profile.name} zaprasza Cię do wspólnej pracy „${ev.title}” — ${ev.date} ${ev.start_time}–${ev.end_time}${form.location ? " @ " + form.location : ""}.`, event_id: ev.id });
+        });
+      });
+    }
+    if (participantRows.length) await supabase.from("event_participants").insert(participantRows);
+    if (notifRows.length) await supabase.from("notifications").insert(notifRows);
+
+    await logAction("event_created", `${profile.name} dodał(a) serię terminów „${form.title || (form.type === "block" ? "Niedostępny/a" : "")}” na ${dates.length} dni.`);
     refreshAll();
+    return { ok: true, count: dates.length, skipped };
   }
 
   async function createRecurringBlock(form) {
@@ -372,7 +436,7 @@ export default function App() {
   }
 
   async function updateEvent(updated) {
-    const isAllDay = updated.type === "block" && updated.allDay;
+    const isAllDay = updated.allDay;
     const startTime = isAllDay ? "00:00" : updated.start;
     const endTime = isAllDay ? "23:59" : updated.end;
     await supabase.from("events").update({
@@ -385,6 +449,12 @@ export default function App() {
   }
 
   async function deleteEvent(ev) {
+    if (ev.type === "work" && ev.participants) {
+      const others = ev.participants.filter(p => p.userId !== profile.id && p.status !== "declined");
+      for (const p of others) {
+        await pushNotification(p.userId, "event_cancelled", `${profile.name} odwołał(a) termin „${ev.title || "(bez tytułu)"}” (${ev.date} ${ev.allDay ? "cały dzień" : `${ev.start}–${ev.end}`}).`, { eventId: ev.id });
+      }
+    }
     await supabase.from("events").delete().eq("id", ev.id);
     await logAction("event_deleted", `${profile.name} usunął(usunęła) termin „${ev.title || "(bez tytułu)"}” (${ev.date} ${ev.start}–${ev.end}).`);
     setShowEditEvent(null);
@@ -480,7 +550,7 @@ export default function App() {
 
   return (
     <div style={{ background: COLORS.bg, minHeight: 600, color: COLORS.text, fontFamily: "Inter, sans-serif", display: "flex", flexDirection: "column" }}>
-      <style>{FONT_IMPORT}</style>
+      <style>{GLOBAL_STYLE}</style>
       <TopNav
         profile={profile} view={view} setView={setView} unreadCount={unreadCount} pendingCount={pendingCount}
         onLogout={() => supabase.auth.signOut()}
@@ -521,7 +591,7 @@ export default function App() {
       {showNewEvent && (
         <EventModal mode="new" profiles={profiles} profile={profile} defaultDate={showNewEvent.date}
           onClose={() => setShowNewEvent(null)} isUserBusy={isUserBusy} conflictEventFor={conflictEventFor}
-          onSubmit={createEvent} onSubmitRange={createBlockRange} />
+          onSubmit={createEvent} onSubmitSeries={createEventSeries} />
       )}
       {showEditEvent && (
         <EventModal mode="edit" profiles={profiles} profile={profile} existing={showEditEvent}
@@ -542,7 +612,7 @@ export default function App() {
 function CenteredMessage({ text }) {
   return (
     <div style={{ background: COLORS.bg, minHeight: 520, display: "flex", alignItems: "center", justifyContent: "center", color: COLORS.textMuted, fontFamily: "Inter, sans-serif" }}>
-      <style>{FONT_IMPORT}</style>
+      <style>{GLOBAL_STYLE}</style>
       <Loader2 className="animate-spin" size={22} style={{ marginRight: 8 }} /> {text}
     </div>
   );
@@ -578,7 +648,7 @@ function AuthScreen() {
 
   return (
     <div style={{ background: COLORS.bg, minHeight: 560, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Inter, sans-serif", padding: 24 }}>
-      <style>{FONT_IMPORT}</style>
+      <style>{GLOBAL_STYLE}</style>
       <div style={{ width: 360, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, padding: 28 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}>
           <div style={{ width: 34, height: 34, borderRadius: 9, background: COLORS.amber, display: "flex", alignItems: "center", justifyContent: "center" }}><CalIcon size={19} color="#12141C" /></div>
@@ -649,7 +719,7 @@ function SetNewPasswordScreen({ onDone }) {
   }
   return (
     <div style={{ background: COLORS.bg, minHeight: 560, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Inter, sans-serif", padding: 24 }}>
-      <style>{FONT_IMPORT}</style>
+      <style>{GLOBAL_STYLE}</style>
       <div style={{ width: 340, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, padding: 28 }}>
         <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: 17, marginBottom: 14 }}>Ustaw nowe hasło</div>
         <LabeledInput label="Nowe hasło" value={password} onChange={setPassword} type="password" placeholder="min. 6 znaków" />
@@ -663,7 +733,7 @@ function SetNewPasswordScreen({ onDone }) {
 function PendingApprovalScreen({ profile, onLogout }) {
   return (
     <div style={{ background: COLORS.bg, minHeight: 560, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Inter, sans-serif", padding: 24 }}>
-      <style>{FONT_IMPORT}</style>
+      <style>{GLOBAL_STYLE}</style>
       <div style={{ width: 360, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, padding: 28, textAlign: "center" }}>
         <AlertTriangle size={26} color={COLORS.amber} style={{ marginBottom: 10 }} />
         <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: 16, marginBottom: 8 }}>Konto oczekuje na zatwierdzenie</div>
@@ -679,40 +749,35 @@ function PendingApprovalScreen({ profile, onLogout }) {
 // ================= TOP NAV =================
 function TopNav({ profile, view, setView, unreadCount, pendingCount, onLogout, onToggleTheme, notifPermission, onRequestNotifPermission, canInstall, onInstall }) {
   const Tab = ({ id, icon: Icon, label, badge }) => (
-    <button onClick={() => setView(id)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 9, background: view === id ? COLORS.panel2 : "transparent", border: "none", color: view === id ? COLORS.text : COLORS.textMuted, cursor: "pointer", fontSize: 13.5, fontWeight: 500, position: "relative" }}>
+    <button onClick={() => setView(id)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 9, background: view === id ? COLORS.panel2 : "transparent", border: "none", color: view === id ? COLORS.text : COLORS.textMuted, cursor: "pointer", fontSize: 13.5, fontWeight: 500, position: "relative", whiteSpace: "nowrap", flexShrink: 0 }}>
       <Icon size={16} /> {label}
       {badge > 0 && <span style={{ position: "absolute", top: -4, right: -4, background: COLORS.rose, color: "#fff", fontSize: 10, borderRadius: 8, minWidth: 16, height: 16, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 3px" }}>{badge}</span>}
     </button>
   );
   const isLight = profile.theme === "light";
+  const iconBtnStyle = (color) => ({ display: "flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, borderRadius: 8, border: `1px solid ${color || COLORS.line}`, background: "transparent", color: color || COLORS.textMuted, cursor: "pointer", flexShrink: 0, position: "relative" });
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "12px 20px", borderBottom: `1px solid ${COLORS.line}`, flexWrap: "wrap" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginRight: 12 }}>
-        <div style={{ width: 26, height: 26, borderRadius: 7, background: COLORS.amber, display: "flex", alignItems: "center", justifyContent: "center" }}><CalIcon size={15} color="#12141C" /></div>
-        <span style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: 15 }}>Grafik zespołu</span>
+    <div style={{ borderBottom: `1px solid ${COLORS.line}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px" }}>
+        <div style={{ width: 26, height: 26, borderRadius: 7, background: COLORS.amber, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><CalIcon size={15} color="#12141C" /></div>
+        <span style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: 15, whiteSpace: "nowrap" }}>Grafik zespołu</span>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+          {canInstall && (
+            <button onClick={onInstall} title="Zainstaluj jako aplikację" style={iconBtnStyle(COLORS.teal)}><CalIcon size={14} /></button>
+          )}
+          {notifPermission !== "granted" && notifPermission !== "unsupported" && (
+            <button onClick={onRequestNotifPermission} title="Włącz powiadomienia" style={iconBtnStyle(COLORS.amber)}><Bell size={14} /></button>
+          )}
+          <button onClick={onToggleTheme} title={isLight ? "Ciemny motyw" : "Jasny motyw"} style={iconBtnStyle()}>{isLight ? <Moon size={14} /> : <Sun size={14} />}</button>
+          <span title={profile.name} style={{ width: 9, height: 9, borderRadius: "50%", background: profile.color, flexShrink: 0 }} />
+          <button onClick={onLogout} title="Wyloguj" style={iconBtnStyle()}><LogOut size={14} /></button>
+        </div>
       </div>
-      <Tab id="calendar" icon={CalIcon} label="Kalendarz" />
-      <Tab id="notifications" icon={Bell} label="Powiadomienia" badge={unreadCount} />
-      <Tab id="profile" icon={UserIcon} label="Mój profil" />
-      {profile.role === "admin" && <Tab id="admin" icon={Settings} label="Panel admina" badge={pendingCount} />}
-      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-        {canInstall && (
-          <button onClick={onInstall} title="Zainstaluj jako aplikację" style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 8, border: `1px solid ${COLORS.teal}`, background: "transparent", color: COLORS.teal, cursor: "pointer", fontSize: 11.5 }}>
-            <CalIcon size={13} /> Zainstaluj
-          </button>
-        )}
-        {notifPermission !== "granted" && notifPermission !== "unsupported" && (
-          <button onClick={onRequestNotifPermission} title="Włącz powiadomienia przeglądarki" style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 8, border: `1px solid ${COLORS.amber}`, background: "transparent", color: COLORS.amber, cursor: "pointer", fontSize: 11.5 }}>
-            <Bell size={13} /> Włącz powiadomienia
-          </button>
-        )}
-        <button onClick={onToggleTheme} title={isLight ? "Ciemny motyw" : "Jasny motyw"} style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.textMuted, cursor: "pointer", fontSize: 11.5 }}>
-          {isLight ? <Moon size={14} /> : <Sun size={14} />} {isLight ? "Ciemny" : "Jasny"}
-        </button>
-        <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: COLORS.textMuted }}>
-          <span style={{ width: 9, height: 9, borderRadius: "50%", background: profile.color }} /> {profile.name}
-        </span>
-        <button onClick={onLogout} title="Wyloguj" style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer", display: "flex" }}><LogOut size={16} /></button>
+      <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "0 8px 8px", overflowX: "auto" }}>
+        <Tab id="calendar" icon={CalIcon} label="Kalendarz" />
+        <Tab id="notifications" icon={Bell} label="Powiadomienia" badge={unreadCount} />
+        <Tab id="profile" icon={UserIcon} label="Mój profil" />
+        {profile.role === "admin" && <Tab id="admin" icon={Settings} label="Panel admina" badge={pendingCount} />}
       </div>
     </div>
   );
@@ -744,19 +809,21 @@ function CalendarView({ profiles, events, profile, calView, setCalView, anchorDa
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
         <button onClick={() => nav(-1)} style={navBtnStyle()}><ChevronLeft size={16} /></button>
         <button onClick={() => nav(1)} style={navBtnStyle()}><ChevronRight size={16} /></button>
         <button onClick={goToday} style={{ ...navBtnStyle(), fontSize: 12, padding: "6px 10px" }}>Dziś</button>
         <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 600, fontSize: 15, marginLeft: 4 }}>{label}</div>
+      </div>
 
-        <div style={{ display: "flex", gap: 4, marginLeft: 8 }}>
-          {[["day", "Dzień"], ["week", "Tydzień"], ["month", "Miesiąc"], ["year", "Rok"]].map(([id, lbl]) => (
-            <button key={id} onClick={() => setCalView(id)} style={{ padding: "6px 10px", borderRadius: 8, fontSize: 12, cursor: "pointer", border: `1px solid ${calView === id ? COLORS.amber : COLORS.line}`, background: calView === id ? COLORS.amber + "22" : "transparent", color: calView === id ? COLORS.text : COLORS.textMuted }}>{lbl}</button>
-          ))}
-        </div>
+      <div style={{ display: "flex", gap: 4, marginBottom: 10, overflowX: "auto", paddingBottom: 2 }}>
+        {[["day", "Dzień"], ["week", "Tydzień"], ["month", "Miesiąc"], ["year", "Rok"]].map(([id, lbl]) => (
+          <button key={id} onClick={() => setCalView(id)} style={{ padding: "6px 10px", borderRadius: 8, fontSize: 12, cursor: "pointer", border: `1px solid ${calView === id ? COLORS.amber : COLORS.line}`, background: calView === id ? COLORS.amber + "22" : "transparent", color: calView === id ? COLORS.text : COLORS.textMuted, whiteSpace: "nowrap", flexShrink: 0 }}>{lbl}</button>
+        ))}
+      </div>
 
-        <div style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           {profiles.map(u => {
             const on = activeFilter.includes(u.id);
             return (
@@ -767,18 +834,20 @@ function CalendarView({ profiles, events, profile, calView, setCalView, anchorDa
             );
           })}
         </div>
-        <button onClick={() => onNewEvent(toISODate(calView === "day" ? anchorDate : new Date()))} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9, border: "none", background: COLORS.amber, color: "#12141C", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
-          <Plus size={15} /> Nowy termin
-        </button>
-        <button onClick={onOpenRecurring} title="Cykliczna niedostępność (np. co wtorek/czwartek w godzinach pracy dla innej firmy)" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.textMuted, fontWeight: 500, fontSize: 12.5, cursor: "pointer" }}>
-          <Repeat size={14} /> Cykliczna niedostępność
-        </button>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <button onClick={() => onNewEvent(toISODate(calView === "day" ? anchorDate : new Date()))} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9, border: "none", background: COLORS.amber, color: "#12141C", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
+            <Plus size={15} /> Nowy termin
+          </button>
+          <button onClick={onOpenRecurring} title="Cykliczna niedostępność (np. co wtorek/czwartek w godzinach pracy dla innej firmy)" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.textMuted, fontWeight: 500, fontSize: 12.5, cursor: "pointer" }}>
+            <Repeat size={14} /> Cykliczna niedostępność
+          </button>
+        </div>
       </div>
 
       {calView === "day" && <DayView day={anchorDate} profiles={profiles} eventsForDay={eventsForDay} onNewEvent={onNewEvent} onEditEvent={onEditEvent} />}
       {calView === "week" && <WeekView weekStart={startOfWeek(anchorDate)} profiles={profiles} eventsForDay={eventsForDay} onNewEvent={onNewEvent} onEditEvent={onEditEvent} />}
       {calView === "month" && <MonthView anchorDate={anchorDate} profiles={profiles} eventsForDay={eventsForDay} onNewEvent={onNewEvent} onDayClick={goToDay} />}
-      {calView === "year" && <YearView anchorDate={anchorDate} eventsForDay={eventsForDay} onMonthClick={(d) => { setAnchorDate(d); setCalView("month"); }} onDayClick={goToDay} />}
+      {calView === "year" && <YearView anchorDate={anchorDate} profiles={profiles} eventsForDay={eventsForDay} onMonthClick={(d) => { setAnchorDate(d); setCalView("month"); }} onDayClick={goToDay} />}
     </div>
   );
 }
@@ -805,7 +874,7 @@ function DayView({ day, profiles, eventsForDay, onNewEvent, onEditEvent }) {
 function WeekView({ weekStart, profiles, eventsForDay, onNewEvent, onEditEvent }) {
   const days = [0, 1, 2, 3, 4, 5, 6].map(i => addDays(weekStart, i));
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(140px, 1fr))", gap: 10, overflowX: "auto" }}>
+    <div className="week-grid">
       {days.map(day => {
         const iso = toISODate(day);
         const isToday = iso === toISODate(new Date());
@@ -871,7 +940,7 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
   );
 }
 
-function YearView({ anchorDate, eventsForDay, onMonthClick, onDayClick }) {
+function YearView({ anchorDate, profiles, eventsForDay, onMonthClick, onDayClick }) {
   const year = anchorDate.getFullYear();
   const todayIso = toISODate(new Date());
   return (
@@ -887,16 +956,23 @@ function YearView({ anchorDate, eventsForDay, onMonthClick, onDayClick }) {
                 const iso = toISODate(day);
                 const inMonth = day.getMonth() === mi;
                 const isToday = iso === todayIso;
-                const hasEvents = inMonth && eventsForDay(iso).length > 0;
+                const dayEvs = inMonth ? eventsForDay(iso) : [];
+                const ownerColors = [...new Set(dayEvs.map(e => e.ownerId))].map(id => userColor(id, profiles)).slice(0, 4);
                 return (
                   <div key={i} onClick={() => inMonth && onDayClick(day)} style={{
-                    aspectRatio: "1", display: "flex", alignItems: "center", justifyContent: "center", position: "relative",
+                    aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", position: "relative",
                     fontSize: 9.5, borderRadius: 4, cursor: inMonth ? "pointer" : "default",
                     color: !inMonth ? COLORS.line : isToday ? "#12141C" : COLORS.textMuted,
                     background: isToday ? COLORS.amber : "transparent", fontWeight: isToday ? 700 : 400,
                   }}>
                     {inMonth ? day.getDate() : ""}
-                    {hasEvents && !isToday && <span style={{ position: "absolute", bottom: 1, width: 3, height: 3, borderRadius: "50%", background: COLORS.amber }} />}
+                    {ownerColors.length > 0 && (
+                      <span style={{ position: "absolute", bottom: 1, display: "flex", gap: 1 }}>
+                        {ownerColors.map((c, ci) => (
+                          <span key={ci} style={{ width: 3, height: 3, borderRadius: "50%", background: isToday ? "#12141C" : c }} />
+                        ))}
+                      </span>
+                    )}
                   </div>
                 );
               })}
@@ -942,12 +1018,40 @@ function EventCard({ ev, profiles, onClick }) {
 }
 
 // ================= EVENT MODAL =================
-function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, onSubmit, onSubmitRange, onDelete, isUserBusy, conflictEventFor, onInviteUser, onRequestJoin, onDeleteRecurring }) {
+function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, onSubmit, onSubmitSeries, onDelete, isUserBusy, conflictEventFor, onInviteUser, onRequestJoin, onDeleteRecurring }) {
   const [form, setForm] = useState(() => existing ? {
     title: existing.title, date: existing.date, start: existing.start, end: existing.end, allDay: !!existing.allDay,
-    location: existing.location || "", notes: existing.notes || "", type: existing.type, rangeMode: false, dateTo: existing.date,
+    location: existing.location || "", notes: existing.notes || "", type: existing.type, seriesMode: false, dates: [],
     participantIds: [], pendingJoinUserIds: [], joinMessage: "",
-  } : { title: "", date: defaultDate, dateTo: defaultDate, start: "09:00", end: "10:00", allDay: false, rangeMode: false, location: "", notes: "", type: "work", participantIds: [], pendingJoinUserIds: [], joinMessage: "" });
+  } : { title: "", date: defaultDate, start: "09:00", end: "10:00", allDay: false, seriesMode: false, dates: [], location: "", notes: "", type: "work", participantIds: [], pendingJoinUserIds: [], joinMessage: "" });
+  const [seriesDayInput, setSeriesDayInput] = useState(defaultDate || toISODate(new Date()));
+  const [seriesRangeFrom, setSeriesRangeFrom] = useState(defaultDate || toISODate(new Date()));
+  const [seriesRangeTo, setSeriesRangeTo] = useState(defaultDate || toISODate(new Date()));
+  const [seriesError, setSeriesError] = useState("");
+  const [seriesResult, setSeriesResult] = useState(null); // {count, skipped} after successful submit
+
+  const MAX_SERIES_DAYS_AHEAD = 186; // ~6 miesięcy
+  const MAX_SERIES_DATES = 150;
+  const maxAllowedDate = toISODate(addDays(new Date(), MAX_SERIES_DAYS_AHEAD));
+
+  function addSeriesDay(iso) {
+    setSeriesError("");
+    if (!iso) return;
+    if (iso > maxAllowedDate) { setSeriesError("Można planować maksymalnie 6 miesięcy do przodu."); return; }
+    if (form.dates.includes(iso)) return;
+    if (form.dates.length >= MAX_SERIES_DATES) { setSeriesError(`Maksymalnie ${MAX_SERIES_DATES} dni w jednej serii.`); return; }
+    setForm(f => ({ ...f, dates: [...f.dates, iso].sort() }));
+  }
+  function addSeriesRange(fromIso, toIso) {
+    setSeriesError("");
+    if (!fromIso || !toIso || toIso < fromIso) { setSeriesError("Zły zakres dat."); return; }
+    if (toIso > maxAllowedDate) { setSeriesError("Można planować maksymalnie 6 miesięcy do przodu."); return; }
+    const next = new Set(form.dates);
+    for (let d = new Date(fromIso); d <= new Date(toIso); d.setDate(d.getDate() + 1)) next.add(toISODate(d));
+    if (next.size > MAX_SERIES_DATES) { setSeriesError(`Maksymalnie ${MAX_SERIES_DATES} dni w jednej serii.`); return; }
+    setForm(f => ({ ...f, dates: [...next].sort() }));
+  }
+  function removeSeriesDay(iso) { setForm(f => ({ ...f, dates: f.dates.filter(d => d !== iso) })); }
 
   // Read-only view for a single occurrence of a recurring unavailability rule —
   // editing one occurrence isn't supported; the whole rule is managed from
@@ -979,10 +1083,14 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
   function togglePendingJoin(uid) { setForm(f => ({ ...f, pendingJoinUserIds: f.pendingJoinUserIds.includes(uid) ? f.pendingJoinUserIds.filter(id => id !== uid) : [...f.pendingJoinUserIds, uid] })); }
   function busyCheck(uid) { return isUserBusy(uid, form.date, form.start, form.end, existing ? existing.id : null); }
 
-  function submit() {
-    if (form.type === "block" && form.rangeMode) {
-      if (!form.date || !form.dateTo || (!form.allDay && (!form.start || !form.end))) return;
-      onSubmitRange({ title: form.title, dateFrom: form.date, dateTo: form.dateTo, allDay: form.allDay, start: form.start, end: form.end, notes: form.notes });
+  async function submit() {
+    if (form.seriesMode) {
+      if (form.dates.length === 0) { setSeriesError("Dodaj co najmniej jeden dzień do serii."); return; }
+      if (!form.allDay && (!form.start || !form.end)) { setSeriesError("Podaj godziny albo zaznacz „Cały dzień”."); return; }
+      if (form.type === "work" && !form.title.trim()) { setSeriesError("Podaj tytuł terminu."); return; }
+      const res = await onSubmitSeries({ ...form, title: form.title.trim() || (form.type === "block" ? "Niedostępny/a" : "") });
+      if (res && res.ok) setSeriesResult({ count: res.count, skipped: res.skipped });
+      else setSeriesError((res && res.error) || "Coś poszło nie tak.");
       return;
     }
     if (!form.title.trim() && !(form.type === "block")) return;
@@ -992,55 +1100,93 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
     else onSubmit(payload);
   }
 
+  if (seriesResult) {
+    return (
+      <ModalShell onClose={onClose} title="Seria dodana">
+        <div style={{ fontSize: 13, color: COLORS.text, lineHeight: 1.6, marginBottom: 14 }}>
+          Dodano terminy na <b>{seriesResult.count}</b> {seriesResult.count === 1 ? "dzień" : "dni"}.
+          {seriesResult.skipped > 0 && <div style={{ color: COLORS.amber, marginTop: 6 }}>Pominięto {seriesResult.skipped} zaprosze{seriesResult.skipped === 1 ? "nie" : "ń"} z powodu konfliktu terminu u zapraszanej osoby — sprawdź te dni osobno.</div>}
+        </div>
+        <button onClick={onClose} style={primaryBtnStyle()}>OK</button>
+      </ModalShell>
+    );
+  }
+
   return (
     <ModalShell onClose={onClose} title={mode === "new" ? "Nowy termin" : "Szczegóły terminu"}>
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <Field label="Rodzaj">
           <div style={{ display: "flex", gap: 8 }}>
-            <ChoiceBtn active={form.type === "work"} onClick={() => setForm(f => ({ ...f, type: "work", rangeMode: false }))} disabled={!canEdit}>Wspólna praca</ChoiceBtn>
+            <ChoiceBtn active={form.type === "work"} onClick={() => setForm(f => ({ ...f, type: "work" }))} disabled={!canEdit}>Wspólna praca</ChoiceBtn>
             <ChoiceBtn active={form.type === "block"} onClick={() => setForm(f => ({ ...f, type: "block", participantIds: [] }))} disabled={!canEdit}>Moja niedostępność</ChoiceBtn>
           </div>
         </Field>
 
-        <Field label={form.type === "block" ? "Tytuł (np. Urlop, Zwolnienie)" : "Tytuł"}>
+        <Field label={form.type === "block" ? "Tytuł (np. Urlop, Zwolnienie)" : "Tytuł (np. Zlecenie, nazwa pracy)"}>
           <Input value={form.title} onChange={v => setForm(f => ({ ...f, title: v }))} disabled={!canEdit} placeholder={form.type === "block" ? "np. Urlop" : "np. Instalacja u klienta X"} />
         </Field>
 
-        {form.type === "block" && mode === "new" && (
+        {mode === "new" && (
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.text, cursor: "pointer" }}>
-            <input type="checkbox" checked={form.rangeMode} onChange={e => setForm(f => ({ ...f, rangeMode: e.target.checked, dateTo: f.date }))} disabled={!canEdit} />
-            Kilka dni / tygodni naraz (np. urlop)
+            <input type="checkbox" checked={form.seriesMode} onChange={e => setForm(f => ({ ...f, seriesMode: e.target.checked }))} disabled={!canEdit} />
+            Seria dat — kilka dni, niekoniecznie po sobie (urlop, zlecenie rozłożone na tygodnie…)
           </label>
         )}
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <Field label={form.rangeMode ? "Od (data)" : "Data"} style={{ flex: 1, minWidth: 120 }}>
-            <Input type="date" value={form.date} onChange={v => setForm(f => ({ ...f, date: v, dateTo: f.rangeMode && f.dateTo < v ? v : f.dateTo }))} disabled={!canEdit} />
-          </Field>
-          {form.type === "block" && form.rangeMode && (
-            <Field label="Do (data)" style={{ flex: 1, minWidth: 120 }}>
-              <Input type="date" value={form.dateTo} onChange={v => setForm(f => ({ ...f, dateTo: v }))} disabled={!canEdit} />
+        {!form.seriesMode ? (
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <Field label="Data" style={{ flex: 1, minWidth: 120 }}>
+              <Input type="date" value={form.date} onChange={v => setForm(f => ({ ...f, date: v }))} disabled={!canEdit} />
             </Field>
-          )}
-          {!form.allDay && (
-            <>
-              <Field label="Od" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} disabled={!canEdit} /></Field>
-              <Field label="Do" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} disabled={!canEdit} /></Field>
-            </>
-          )}
-        </div>
-
-        {form.type === "block" && (
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.text, cursor: "pointer" }}>
-            <input type="checkbox" checked={form.allDay} onChange={e => setForm(f => ({ ...f, allDay: e.target.checked }))} disabled={!canEdit} />
-            Cały dzień (bez podawania godzin)
-          </label>
+            {!form.allDay && (
+              <>
+                <Field label="Od" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} disabled={!canEdit} /></Field>
+                <Field label="Do" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} disabled={!canEdit} /></Field>
+              </>
+            )}
+          </div>
+        ) : (
+          <Field label={`Wybrane dni (${form.dates.length}${form.dates.length ? `, max ${MAX_SERIES_DATES}` : ""})`}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ display: "flex", gap: 6, alignItems: "flex-end", flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 130 }}><Input type="date" value={seriesDayInput} onChange={setSeriesDayInput} /></div>
+                <button onClick={() => addSeriesDay(seriesDayInput)} style={{ ...secondaryBtnStyle(), padding: "8px 10px", fontSize: 12 }}>+ Dodaj dzień</button>
+              </div>
+              <div style={{ display: "flex", gap: 6, alignItems: "flex-end", flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 110 }}><Field label="Od"><Input type="date" value={seriesRangeFrom} onChange={setSeriesRangeFrom} /></Field></div>
+                <div style={{ flex: 1, minWidth: 110 }}><Field label="Do"><Input type="date" value={seriesRangeTo} onChange={setSeriesRangeTo} /></Field></div>
+                <button onClick={() => addSeriesRange(seriesRangeFrom, seriesRangeTo)} style={{ ...secondaryBtnStyle(), padding: "8px 10px", fontSize: 12 }}>+ Dodaj zakres</button>
+              </div>
+              {seriesError && <div style={{ fontSize: 11.5, color: COLORS.rose }}>{seriesError}</div>}
+              {form.dates.length > 0 && (
+                <div style={{ display: "flex", gap: 5, flexWrap: "wrap", maxHeight: 110, overflowY: "auto", padding: "6px 0" }}>
+                  {form.dates.map(d => (
+                    <span key={d} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, padding: "3px 6px", borderRadius: 6, background: COLORS.bg, border: `1px solid ${COLORS.line}` }}>
+                      {d} <button onClick={() => removeSeriesDay(d)} style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.textMuted, display: "flex", padding: 0 }}><X size={11} /></button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {!form.allDay && (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Field label="Godzina od" style={{ flex: 1 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} /></Field>
+                  <Field label="Godzina do" style={{ flex: 1 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} /></Field>
+                </div>
+              )}
+              <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Te same godziny (albo cały dzień) zostaną zastosowane do każdego wybranego dnia.</div>
+            </div>
+          </Field>
         )}
+
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.text, cursor: "pointer" }}>
+          <input type="checkbox" checked={form.allDay} onChange={e => setForm(f => ({ ...f, allDay: e.target.checked }))} disabled={!canEdit} />
+          Cały dzień (bez podawania godzin)
+        </label>
 
         {form.type === "work" && <Field label="Lokalizacja"><Input value={form.location} onChange={v => setForm(f => ({ ...f, location: v }))} disabled={!canEdit} placeholder="adres / miejsce" /></Field>}
         <Field label="Notatki"><Input value={form.notes} onChange={v => setForm(f => ({ ...f, notes: v }))} disabled={!canEdit} placeholder="opcjonalnie" /></Field>
 
-        {form.type === "work" && mode === "new" && (
+        {form.type === "work" && mode === "new" && !form.seriesMode && (
           <Field label="Z kim dzielisz ten termin">
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {others.map(u => {
@@ -1063,6 +1209,25 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
         )}
         {form.type === "work" && mode === "new" && form.pendingJoinUserIds.length > 0 && (
           <Field label="Wiadomość do zajętych osób (opcjonalnie)"><Input value={form.joinMessage} onChange={v => setForm(f => ({ ...f, joinMessage: v }))} placeholder="np. Czy mógłbyś/mogłabyś przełożyć swój termin?" /></Field>
+        )}
+
+        {form.type === "work" && mode === "new" && form.seriesMode && (
+          <Field label="Z kim dzielisz tę serię">
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {others.map(u => {
+                const checked = form.participantIds.includes(u.id);
+                return (
+                  <div key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 8, background: COLORS.bg, border: `1px solid ${COLORS.line}` }}>
+                    <input type="checkbox" checked={checked} disabled={!canEdit} onChange={() => toggleParticipant(u.id)} />
+                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: u.color }} />
+                    <span style={{ fontSize: 13, flex: 1 }}>{u.name}</span>
+                  </div>
+                );
+              })}
+              {others.length === 0 && <div style={{ fontSize: 12, color: COLORS.textMuted }}>Brak innych zatwierdzonych pracowników.</div>}
+              <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Jeśli ktoś akurat będzie zajęty w konkretnym dniu z serii, zaproszenie na ten jeden dzień zostanie pominięte — resztę dostanie normalnie.</div>
+            </div>
+          </Field>
         )}
 
         {form.type === "work" && existing && (
@@ -1103,7 +1268,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
         )}
 
         <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-          {canEdit && <button onClick={submit} style={primaryBtnStyle()}>{mode === "new" ? (form.type === "block" && form.rangeMode ? "Dodaj niedostępność" : "Utwórz termin") : "Zapisz zmiany"}</button>}
+          {canEdit && <button onClick={submit} style={primaryBtnStyle()}>{mode === "new" ? (form.seriesMode ? `Utwórz serię (${form.dates.length})` : "Utwórz termin") : "Zapisz zmiany"}</button>}
           {existing && (profile.role === "admin" || existing.ownerId === profile.id) && (
             <button onClick={() => onDelete(existing)} style={{ ...secondaryBtnStyle(), color: COLORS.rose, borderColor: COLORS.rose }}><Trash2 size={14} /> Usuń</button>
           )}
@@ -1267,7 +1432,7 @@ function NotificationsView({ notifs, profiles, onAcceptInvite, onDeclineInvite, 
                     <button onClick={(e) => { e.stopPropagation(); onDeclineJoin(n); }} style={{ ...secondaryBtnStyle(), padding: "5px 10px", fontSize: 12 }}><X size={12} /> Odrzuć</button>
                   </div>
                 )}
-                {(n.type === "invite_response" || n.type === "join_response" || n.type === "info") && (
+                {(n.type === "invite_response" || n.type === "join_response" || n.type === "event_cancelled" || n.type === "info") && (
                   <button onClick={(e) => { e.stopPropagation(); onDismiss(n.id); }} style={{ fontSize: 11, color: COLORS.textMuted, background: "none", border: "none", cursor: "pointer", marginTop: 6, padding: 0 }}>Ukryj</button>
                 )}
               </div>
@@ -1279,7 +1444,7 @@ function NotificationsView({ notifs, profiles, onAcceptInvite, onDeclineInvite, 
   );
 }
 function NotifIcon({ type }) {
-  const map = { invite: <Bell size={15} color={COLORS.amber} />, join_request: <AlertTriangle size={15} color={COLORS.rose} />, invite_response: <Check size={15} color={COLORS.teal} />, join_response: <Check size={15} color={COLORS.teal} />, info: <Bell size={15} color={COLORS.textMuted} /> };
+  const map = { invite: <Bell size={15} color={COLORS.amber} />, join_request: <AlertTriangle size={15} color={COLORS.rose} />, invite_response: <Check size={15} color={COLORS.teal} />, join_response: <Check size={15} color={COLORS.teal} />, event_cancelled: <X size={15} color={COLORS.rose} />, info: <Bell size={15} color={COLORS.textMuted} /> };
   return map[type] || <Bell size={15} />;
 }
 
