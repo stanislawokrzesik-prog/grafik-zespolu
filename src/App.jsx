@@ -34,7 +34,7 @@ function overlaps(aStart, aEnd, bStart, bEnd) { return timeToMin(aStart) < timeT
 function userColor(userId, profiles) { const u = profiles.find(p => p.id === userId); return u ? u.color : COLORS.textMuted; }
 function userName(userId, profiles) { const u = profiles.find(p => p.id === userId); return u ? u.name : "(usunięty)"; }
 function buildJoinRequestText(fromName, conflictEvent, draftEvent, message) {
-  return `${fromName} pyta, czy możesz zmienić swój termin${conflictEvent ? ` „${conflictEvent.title}” (${conflictEvent.date} ${conflictEvent.start}–${conflictEvent.end})` : ""} i dołączyć do „${draftEvent.title}” (${draftEvent.date} ${draftEvent.start}–${draftEvent.end}${draftEvent.location ? " @ " + draftEvent.location : ""}). Wiadomość: ${message || "—"}`;
+  return `${fromName} pyta, czy możesz zmienić swój termin${conflictEvent ? ` (${conflictEvent.date} ${conflictEvent.start}–${conflictEvent.end})` : ""} i dołączyć do „${draftEvent.title}” (${draftEvent.date} ${draftEvent.start}–${draftEvent.end}${draftEvent.location ? " @ " + draftEvent.location : ""}). Wiadomość: ${message || "—"}`;
 }
 
 // ---------- data access (Supabase) ----------
@@ -43,17 +43,33 @@ async function fetchProfiles() {
   if (error) throw error;
   return data || [];
 }
-async function fetchEvents() {
+async function fetchEvents(isAdmin) {
   const { data, error } = await supabase
     .from("events")
     .select("*, event_participants(user_id,status)")
     .order("date", { ascending: true }).order("start_time", { ascending: true });
   if (error) throw error;
-  return (data || []).map(e => ({
+  const detailed = (data || []).map(e => ({
     id: e.id, title: e.title, date: e.date, start: e.start_time, end: e.end_time,
     location: e.location, notes: e.notes, type: e.type, ownerId: e.owner_id,
     participants: (e.event_participants || []).map(p => ({ userId: p.user_id, status: p.status })),
+    detailed: true,
   }));
+  if (isAdmin) return detailed; // admin already sees every row in full via RLS
+
+  // non-admin: merge own/participant events (full detail) with everyone else's
+  // busy slots (time only, no title/location/notes) so conflicts stay detectable
+  // without exposing what other people are actually doing.
+  const { data: busyRows, error: busyErr } = await supabase.from("event_busy_view").select("*");
+  if (busyErr) throw busyErr;
+  const detailedIds = new Set(detailed.map(e => e.id));
+  const grouped = {};
+  (busyRows || []).forEach(r => {
+    if (detailedIds.has(r.event_id)) return;
+    if (!grouped[r.event_id]) grouped[r.event_id] = { id: r.event_id, date: r.date, start: r.start_time, end: r.end_time, ownerId: r.owner_id, title: null, location: null, notes: null, type: null, participants: [], detailed: false };
+    grouped[r.event_id].participants.push({ userId: r.user_id, status: r.status });
+  });
+  return [...detailed, ...Object.values(grouped)];
 }
 async function fetchNotifications() {
   const { data, error } = await supabase.from("notifications").select("*").order("created_at", { ascending: false });
@@ -64,6 +80,11 @@ async function fetchJoinRequests() {
   const { data, error } = await supabase.from("join_requests").select("*").order("created_at", { ascending: false });
   if (error) throw error;
   return (data || []).map(r => ({ id: r.id, fromUserId: r.from_user_id, toUserId: r.to_user_id, conflictEventId: r.conflict_event_id, draftEventId: r.draft_event_id, message: r.message, status: r.status }));
+}
+async function fetchAuditLog() {
+  const { data, error } = await supabase.from("audit_log").select("*").order("created_at", { ascending: false }).limit(300);
+  if (error) return []; // non-admins get an RLS error here — that's expected, just show nothing
+  return (data || []).map(a => ({ id: a.id, actorId: a.actor_id, action: a.action, details: a.details, timestamp: new Date(a.created_at).getTime() }));
 }
 
 export default function App() {
@@ -76,6 +97,8 @@ export default function App() {
   const [events, setEvents] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [joinRequests, setJoinRequests] = useState([]);
+  const [auditLog, setAuditLog] = useState([]);
+  const loggedLoginRef = useRef(false);
 
   const [view, setView] = useState("calendar");
   const [weekStart, setWeekStart] = useState(startOfWeek(new Date()));
@@ -88,6 +111,19 @@ export default function App() {
     typeof window !== "undefined" && typeof window.Notification !== "undefined" ? window.Notification.permission : "unsupported"
   );
   const seenNotifIds = useRef(null);
+  const [installPrompt, setInstallPrompt] = useState(null);
+
+  useEffect(() => {
+    function onBeforeInstall(e) { e.preventDefault(); setInstallPrompt(e); }
+    window.addEventListener("beforeinstallprompt", onBeforeInstall);
+    return () => window.removeEventListener("beforeinstallprompt", onBeforeInstall);
+  }, []);
+  async function triggerInstall() {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    setInstallPrompt(null);
+  }
 
   applyTheme(profile?.theme || "dark");
 
@@ -118,10 +154,11 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     try {
-      const [p, e, n, j] = await Promise.all([fetchProfiles(), fetchEvents(), fetchNotifications(), fetchJoinRequests()]);
-      setProfiles(p); setEvents(e); setNotifications(n); setJoinRequests(j);
+      const isAdmin = profile?.role === "admin";
+      const [p, e, n, j, a] = await Promise.all([fetchProfiles(), fetchEvents(isAdmin), fetchNotifications(), fetchJoinRequests(), isAdmin ? fetchAuditLog() : Promise.resolve([])]);
+      setProfiles(p); setEvents(e); setNotifications(n); setJoinRequests(j); setAuditLog(a);
     } catch (err) { console.error("Błąd wczytywania danych", err); }
-  }, []);
+  }, [profile?.role]);
 
   // ---------- load data + realtime once approved profile is ready ----------
   useEffect(() => {
@@ -134,6 +171,7 @@ export default function App() {
       .on("postgres_changes", { event: "*", schema: "public", table: "event_participants" }, refreshAll)
       .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, refreshAll)
       .on("postgres_changes", { event: "*", schema: "public", table: "join_requests" }, refreshAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "audit_log" }, refreshAll)
       .subscribe();
     return () => { supabase.removeChannel(channel); };
   }, [profile, refreshAll]);
@@ -178,6 +216,18 @@ export default function App() {
   async function pushNotification(userId, type, message, extra) {
     await supabase.from("notifications").insert({ user_id: userId, type, message, event_id: extra?.eventId || null, request_id: extra?.requestId || null });
   }
+  async function logAction(action, details) {
+    try { await supabase.from("audit_log").insert({ actor_id: profile.id, action, details: details || null }); } catch (e) { /* ignore */ }
+  }
+
+  // log a "login" entry once per session, after the profile is approved and ready
+  useEffect(() => {
+    if (profile && profile.approved && !loggedLoginRef.current) {
+      loggedLoginRef.current = true;
+      supabase.from("audit_log").insert({ actor_id: profile.id, action: "login", details: `${profile.name} zalogował(a) się.` }).then(() => {});
+    }
+    if (!profile) loggedLoginRef.current = false;
+  }, [profile]);
 
   // ---------- mutations ----------
   async function createEvent(form) {
@@ -207,6 +257,7 @@ export default function App() {
         await pushNotification(uid, "join_request", buildJoinRequestText(profile.name, conflict, { ...ev, start: form.start, end: form.end }, form.joinMessage), { requestId: jr.id });
       }
     }
+    await logAction("event_created", `${profile.name} utworzył(a) termin „${form.title}” (${form.date} ${form.start}–${form.end}).`);
     setShowNewEvent(null);
     refreshAll();
   }
@@ -216,12 +267,14 @@ export default function App() {
       title: updated.title, date: updated.date, start_time: updated.start, end_time: updated.end,
       location: updated.location, notes: updated.notes, type: updated.type,
     }).eq("id", updated.id);
+    await logAction("event_updated", `${profile.name} zmodyfikował(a) termin „${updated.title}” (${updated.date} ${updated.start}–${updated.end}).`);
     setShowEditEvent(null);
     refreshAll();
   }
 
   async function deleteEvent(ev) {
     await supabase.from("events").delete().eq("id", ev.id);
+    await logAction("event_deleted", `${profile.name} usunął(usunęła) termin „${ev.title || "(bez tytułu)"}” (${ev.date} ${ev.start}–${ev.end}).`);
     setShowEditEvent(null);
     refreshAll();
   }
@@ -229,6 +282,7 @@ export default function App() {
   async function inviteToExistingEvent(ev, userId) {
     await supabase.from("event_participants").upsert({ event_id: ev.id, user_id: userId, status: "pending" });
     await pushNotification(userId, "invite", `${profile.name} zaprasza Cię do wspólnej pracy „${ev.title}” — ${ev.date} ${ev.start}–${ev.end}${ev.location ? " @ " + ev.location : ""}.`, { eventId: ev.id });
+    await logAction("invite_sent", `${profile.name} zaprosił(a) ${userName(userId, profiles)} do „${ev.title}”.`);
     refreshAll();
   }
 
@@ -236,6 +290,7 @@ export default function App() {
     await supabase.from("event_participants").update({ status: accept ? "accepted" : "declined" }).eq("event_id", notif.eventId).eq("user_id", profile.id);
     const ev = events.find(e => e.id === notif.eventId);
     if (ev) await pushNotification(ev.ownerId, "invite_response", `${profile.name} ${accept ? "zaakceptował(a)" : "odrzucił(a)"} zaproszenie do „${ev.title}” (${ev.date} ${ev.start}–${ev.end}).`);
+    await logAction(accept ? "invite_accepted" : "invite_declined", `${profile.name} ${accept ? "zaakceptował(a)" : "odrzucił(a)"} zaproszenie${ev ? ` do „${ev.title}”` : ""}.`);
     await supabase.from("notifications").delete().eq("id", notif.id);
     refreshAll();
   }
@@ -246,6 +301,7 @@ export default function App() {
       draft_event_id: draftEvent.id, message,
     }).select().single();
     await pushNotification(busyUserId, "join_request", buildJoinRequestText(profile.name, conflictEvent, draftEvent, message), { requestId: jr.id });
+    await logAction("join_request_sent", `${profile.name} poprosił(a) ${userName(busyUserId, profiles)} o zmianę terminu.`);
     setShowJoinReq(null);
     refreshAll();
   }
@@ -261,6 +317,7 @@ export default function App() {
     }
     await supabase.from("join_requests").update({ status: accept ? "accepted" : "declined" }).eq("id", jr.id);
     await pushNotification(jr.fromUserId, "join_response", `${profile.name} ${accept ? "zaakceptował(a) i dołączył(a) do" : "odrzucił(a)"} prośbę o zmianę terminu.`);
+    await logAction(accept ? "join_request_accepted" : "join_request_declined", `${profile.name} ${accept ? "zaakceptował(a) prośbę o zmianę terminu i dołączył(a)" : "odrzucił(a) prośbę o zmianę terminu"} (od ${userName(jr.fromUserId, profiles)}).`);
     await supabase.from("notifications").delete().eq("id", notif.id);
     refreshAll();
   }
@@ -271,15 +328,25 @@ export default function App() {
   async function updateOwnProfile(fields) {
     const { name, color, theme } = fields;
     await supabase.from("profiles").update({ name, color, theme }).eq("id", profile.id);
+    if (fields.name || fields.color) await logAction("profile_updated", `${profile.name} zaktualizował(a) swój profil.`);
     setProfile(p => ({ ...p, ...fields }));
   }
   async function changePassword(newPassword) {
     const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (!error) await logAction("password_changed", `${profile.name} zmienił(a) hasło.`);
     return error ? error.message : null;
   }
 
-  async function adminSetApproved(userId, approved) { await supabase.from("profiles").update({ approved }).eq("id", userId); refreshAll(); }
-  async function adminSetRole(userId, role) { await supabase.from("profiles").update({ role }).eq("id", userId); refreshAll(); }
+  async function adminSetApproved(userId, approved) {
+    await supabase.from("profiles").update({ approved }).eq("id", userId);
+    await logAction(approved ? "user_approved" : "user_blocked", `${profile.name} ${approved ? "zatwierdził(a)" : "zablokował(a)"} konto ${userName(userId, profiles)}.`);
+    refreshAll();
+  }
+  async function adminSetRole(userId, role) {
+    await supabase.from("profiles").update({ role }).eq("id", userId);
+    await logAction("role_changed", `${profile.name} zmienił(a) rolę ${userName(userId, profiles)} na "${role}".`);
+    refreshAll();
+  }
   async function adminSendPasswordReset(email) {
     await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
   }
@@ -307,6 +374,7 @@ export default function App() {
         onLogout={() => supabase.auth.signOut()}
         onToggleTheme={() => updateOwnProfile({ theme: profile.theme === "light" ? "dark" : "light" })}
         notifPermission={notifPermission} onRequestNotifPermission={requestNotifPermission}
+        canInstall={!!installPrompt} onInstall={triggerInstall}
       />
       <div style={{ flex: 1, padding: "16px 20px 28px" }}>
         {view === "calendar" && (
@@ -329,7 +397,7 @@ export default function App() {
         {view === "profile" && <ProfileView profile={profile} onUpdate={updateOwnProfile} onChangePassword={changePassword} />}
         {view === "admin" && profile.role === "admin" && (
           <AdminPanel
-            profiles={profiles} events={events}
+            profiles={profiles} events={events} auditLog={auditLog}
             onSetApproved={adminSetApproved} onSetRole={adminSetRole}
             onSendPasswordReset={adminSendPasswordReset}
             onDeleteEvent={deleteEvent} onEditEvent={(ev) => setShowEditEvent(ev)}
@@ -491,7 +559,7 @@ function PendingApprovalScreen({ profile, onLogout }) {
 }
 
 // ================= TOP NAV =================
-function TopNav({ profile, view, setView, unreadCount, pendingCount, onLogout, onToggleTheme, notifPermission, onRequestNotifPermission }) {
+function TopNav({ profile, view, setView, unreadCount, pendingCount, onLogout, onToggleTheme, notifPermission, onRequestNotifPermission, canInstall, onInstall }) {
   const Tab = ({ id, icon: Icon, label, badge }) => (
     <button onClick={() => setView(id)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 9, background: view === id ? COLORS.panel2 : "transparent", border: "none", color: view === id ? COLORS.text : COLORS.textMuted, cursor: "pointer", fontSize: 13.5, fontWeight: 500, position: "relative" }}>
       <Icon size={16} /> {label}
@@ -510,6 +578,11 @@ function TopNav({ profile, view, setView, unreadCount, pendingCount, onLogout, o
       <Tab id="profile" icon={UserIcon} label="Mój profil" />
       {profile.role === "admin" && <Tab id="admin" icon={Settings} label="Panel admina" badge={pendingCount} />}
       <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+        {canInstall && (
+          <button onClick={onInstall} title="Zainstaluj jako aplikację" style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 8, border: `1px solid ${COLORS.teal}`, background: "transparent", color: COLORS.teal, cursor: "pointer", fontSize: 11.5 }}>
+            <CalIcon size={13} /> Zainstaluj
+          </button>
+        )}
         {notifPermission !== "granted" && notifPermission !== "unsupported" && (
           <button onClick={onRequestNotifPermission} title="Włącz powiadomienia przeglądarki" style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 8, border: `1px solid ${COLORS.amber}`, background: "transparent", color: COLORS.amber, cursor: "pointer", fontSize: 11.5 }}>
             <Bell size={13} /> Włącz powiadomienia
@@ -582,6 +655,19 @@ function navBtnStyle() { return { background: COLORS.panel, border: `1px solid $
 function EventCard({ ev, profiles, onClick }) {
   const ownerColor = userColor(ev.ownerId, profiles);
   const isBlock = ev.type === "block";
+  if (!ev.detailed) {
+    return (
+      <div title="Zajęty/a — szczegóły widzi tylko właściciel terminu i admin" style={{ borderRadius: 8, padding: "7px 9px", background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderLeftWidth: 3, borderLeftColor: ownerColor, opacity: 0.85 }}>
+        <div style={{ fontSize: 11, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {ev.start}–{ev.end}</div>
+        <div style={{ fontSize: 12.5, fontWeight: 600, margin: "2px 0", color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 5 }}><Ban size={11} /> Zajęty/a</div>
+        <div style={{ display: "flex", gap: 3, marginTop: 5, flexWrap: "wrap" }}>
+          {ev.participants.filter(p => p.status !== "declined").map(p => (
+            <span key={p.userId} title={userName(p.userId, profiles)} style={{ width: 8, height: 8, borderRadius: "50%", background: userColor(p.userId, profiles) }} />
+          ))}
+        </div>
+      </div>
+    );
+  }
   return (
     <div onClick={onClick} style={{ cursor: "pointer", borderRadius: 8, padding: "7px 9px", background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderLeftWidth: 3, borderLeftColor: ownerColor }}>
       <div style={{ fontSize: 11, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {ev.start}–{ev.end}</div>
@@ -840,7 +926,7 @@ function ProfileView({ profile, onUpdate, onChangePassword }) {
 }
 
 // ================= ADMIN PANEL =================
-function AdminPanel({ profiles, events, onSetApproved, onSetRole, onSendPasswordReset, onDeleteEvent, onEditEvent }) {
+function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSendPasswordReset, onDeleteEvent, onEditEvent }) {
   const [tab, setTab] = useState("team");
   const pending = profiles.filter(p => !p.approved);
   const approved = profiles.filter(p => p.approved);
@@ -850,7 +936,7 @@ function AdminPanel({ profiles, events, onSetApproved, onSetRole, onSendPassword
     <div style={{ maxWidth: 780 }}>
       <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: 18, marginBottom: 14 }}>Panel admina</div>
       <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-        {[["team", `Zespół${pending.length ? ` (${pending.length} oczekuje)` : ""}`], ["events", "Wszystkie terminy"]].map(([id, label]) => (
+        {[["team", `Zespół${pending.length ? ` (${pending.length} oczekuje)` : ""}`], ["events", "Wszystkie terminy"], ["activity", "Aktywność"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} style={{ padding: "7px 12px", borderRadius: 8, border: `1px solid ${tab === id ? COLORS.amber : COLORS.line}`, background: tab === id ? COLORS.amber + "22" : "transparent", color: COLORS.text, fontSize: 12.5, cursor: "pointer" }}>{label}</button>
         ))}
       </div>
@@ -908,6 +994,31 @@ function AdminPanel({ profiles, events, onSetApproved, onSetRole, onSendPassword
           ))}
         </div>
       )}
+
+      {tab === "activity" && (
+        <div>
+          <div style={{ fontSize: 11.5, color: COLORS.textMuted, marginBottom: 10 }}>Ostatnie 300 zdarzeń — logowania, terminy, zaproszenia, prośby o zmianę, zmiany profilu i decyzje admina.</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 520, overflowY: "auto" }}>
+            {auditLog.length === 0 && <div style={{ color: COLORS.textMuted, fontSize: 13 }}>Brak zarejestrowanej aktywności.</div>}
+            {auditLog.map(a => (
+              <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 10px", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 8, fontSize: 12 }}>
+                <span style={{ color: COLORS.textMuted, width: 140, flexShrink: 0 }}>{new Date(a.timestamp).toLocaleString("pl-PL")}</span>
+                <ActivityBadge action={a.action} />
+                <span style={{ flex: 1 }}>{a.details}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
+}
+const ACTIVITY_LABELS = {
+  login: "Logowanie", event_created: "Nowy termin", event_updated: "Edycja terminu", event_deleted: "Usunięcie terminu",
+  invite_sent: "Zaproszenie", invite_accepted: "Akceptacja", invite_declined: "Odrzucenie",
+  join_request_sent: "Prośba o zmianę", join_request_accepted: "Zmiana terminu", join_request_declined: "Odrzucenie prośby",
+  profile_updated: "Profil", password_changed: "Zmiana hasła", user_approved: "Zatwierdzenie", user_blocked: "Blokada", role_changed: "Zmiana roli",
+};
+function ActivityBadge({ action }) {
+  return <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 20, border: `1px solid ${COLORS.line}`, color: COLORS.textMuted, flexShrink: 0, whiteSpace: "nowrap" }}>{ACTIVITY_LABELS[action] || action}</span>;
 }
