@@ -329,6 +329,23 @@ export default function App() {
   async function pushNotification(userId, type, message, extra) {
     await supabase.from("notifications").insert({ user_id: userId, type, message, event_id: extra?.eventId || null, request_id: extra?.requestId || null });
   }
+  // Gdy ktoś tworzy sobie termin/niedostępność, która koliduje z terminem, w którym
+  // już (jako uczestnik, nie właściciel) bierze udział — informujemy właściciela TEGO
+  // drugiego terminu, że pojawiła się kolizja i dana osoba może być niedostępna.
+  async function notifyConflictOwners(userId, date, start, end, excludeEventId, newTitle) {
+    const conflicts = events.filter(ev => {
+      if (ev.id === excludeEventId || ev.date !== date || ev.ownerId === userId || ev.ownerId === profile.id) return false;
+      const p = ev.participants && ev.participants.find(pp => pp.userId === userId && pp.status !== "declined");
+      if (!p) return false;
+      return overlaps(start, end, ev.start, ev.end);
+    });
+    const seenOwners = new Set();
+    for (const c of conflicts) {
+      if (seenOwners.has(c.ownerId)) continue;
+      seenOwners.add(c.ownerId);
+      await pushNotification(c.ownerId, "info", `Uwaga: ${userName(userId, profiles)} dodał(a) sobie „${newTitle}” (${date} ${start}–${end}), co koliduje z Twoim terminem „${c.title || "(bez tytułu)"}” — może być niedostępny/a.`);
+    }
+  }
   async function logAction(action, details) {
     try { await supabase.from("audit_log").insert({ actor_id: profile.id, action, details: details || null }); } catch (e) { /* ignore */ }
   }
@@ -374,6 +391,7 @@ export default function App() {
       }
     }
     await logAction("event_created", `${profile.name} utworzył(a) termin „${form.title}” (${form.date} ${isAllDay ? "cały dzień" : `${startTime}–${endTime}`}).`);
+    await notifyConflictOwners(profile.id, form.date, startTime, endTime, ev.id, form.title);
     setShowNewEvent(null);
     refreshAll();
   }
@@ -398,26 +416,39 @@ export default function App() {
     if (error) { console.error(error); return { ok: false, error: error.message }; }
 
     const participantRows = inserted.map(ev => ({ event_id: ev.id, user_id: profile.id, status: "accepted" }));
-    const notifRows = [];
-    let skipped = 0;
+    let pendingApproval = 0;
     if (form.type === "work") {
-      inserted.forEach((ev, idx) => {
+      for (let idx = 0; idx < inserted.length; idx++) {
+        const ev = inserted[idx];
         const entry = entries[idx];
-        (entry.participantIds || []).forEach(pid => {
-          if (pid === profile.id) return;
+        for (const pid of (entry.participantIds || [])) {
+          if (pid === profile.id) continue;
           const busy = isUserBusy(pid, ev.date, ev.start_time, ev.end_time, null);
-          if (busy) { skipped++; return; }
-          participantRows.push({ event_id: ev.id, user_id: pid, status: "pending" });
-          notifRows.push({ user_id: pid, type: "invite", message: `${profile.name} zaprasza Cię do wspólnej pracy „${ev.title}” — ${ev.date} ${ev.all_day ? "cały dzień" : `${ev.start_time}–${ev.end_time}`}${form.location ? " @ " + form.location : ""}.`, event_id: ev.id });
-        });
-      });
+          if (busy) {
+            // zajęty tego dnia — wysyłamy zapytanie o akceptację zamiast ciche pomijać
+            const conflict = conflictEventFor(pid, ev.date, ev.start_time, ev.end_time, null);
+            const { data: jr } = await supabase.from("join_requests").insert({
+              from_user_id: profile.id, to_user_id: pid, conflict_event_id: conflict ? conflict.id : null,
+              draft_event_id: ev.id, message: form.joinMessage || "",
+            }).select().single();
+            await pushNotification(pid, "join_request", buildJoinRequestText(profile.name, conflict, { ...ev, start: ev.start_time, end: ev.end_time, location: form.location }, form.joinMessage), { requestId: jr.id });
+            pendingApproval++;
+          } else {
+            participantRows.push({ event_id: ev.id, user_id: pid, status: "pending" });
+            await pushNotification(pid, "invite", `${profile.name} zaprasza Cię do wspólnej pracy „${ev.title}” — ${ev.date} ${ev.all_day ? "cały dzień" : `${ev.start_time}–${ev.end_time}`}${form.location ? " @ " + form.location : ""}.`, { eventId: ev.id });
+          }
+        }
+      }
     }
     if (participantRows.length) await supabase.from("event_participants").insert(participantRows);
-    if (notifRows.length) await supabase.from("notifications").insert(notifRows);
+
+    for (const ev of inserted) {
+      await notifyConflictOwners(profile.id, ev.date, ev.start_time, ev.end_time, ev.id, ev.title);
+    }
 
     await logAction("event_created", `${profile.name} dodał(a) serię terminów „${form.title || (form.type === "block" ? "Niedostępny/a" : "")}” na ${entries.length} dni.`);
     refreshAll();
-    return { ok: true, count: entries.length, skipped };
+    return { ok: true, count: entries.length, skipped: pendingApproval };
   }
 
   async function createRecurringBlock(form) {
@@ -1081,6 +1112,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
       <ModalShell onClose={onClose} title="Cykliczna niedostępność">
         <div style={{ fontSize: 13, color: COLORS.textMuted, lineHeight: 1.6, marginBottom: 14 }}>
           To wystąpienie cyklicznej reguły{existing.detailed && existing.title ? ` „${existing.title}”` : ""} — {existing.date}, {existing.allDay ? "cały dzień" : `${existing.start}–${existing.end}`}.
+          <br />Dotyczy: <b style={{ color: COLORS.text }}>{userName(existing.ownerId, profiles)}</b>.
           Pojedynczych wystąpień nie da się edytować — regułą zarządzasz w całości.
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -1125,7 +1157,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
       <ModalShell onClose={onClose} title="Seria dodana">
         <div style={{ fontSize: 13, color: COLORS.text, lineHeight: 1.6, marginBottom: 14 }}>
           Dodano terminy na <b>{seriesResult.count}</b> {seriesResult.count === 1 ? "dzień" : "dni"}.
-          {seriesResult.skipped > 0 && <div style={{ color: COLORS.amber, marginTop: 6 }}>Pominięto {seriesResult.skipped} zaprosze{seriesResult.skipped === 1 ? "nie" : "ń"} z powodu konfliktu terminu u zapraszanej osoby — sprawdź te dni osobno.</div>}
+          {seriesResult.skipped > 0 && <div style={{ color: COLORS.amber, marginTop: 6 }}>Dla {seriesResult.skipped} {seriesResult.skipped === 1 ? "osoby, która była" : "osób, które były"} zajęte danego dnia, wysłano zapytanie o akceptację zamiast zwykłego zaproszenia — dostaniesz powiadomienie o ich decyzji.</div>}
         </div>
         <button onClick={onClose} style={primaryBtnStyle()}>OK</button>
       </ModalShell>
@@ -1135,6 +1167,23 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
   return (
     <ModalShell onClose={onClose} title={mode === "new" ? "Nowy termin" : "Szczegóły terminu"}>
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {existing && (
+          <div style={{ fontSize: 12, color: COLORS.textMuted, background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "8px 10px" }}>
+            <div><span style={{ color: COLORS.textMuted }}>Zainicjował/a: </span><b style={{ color: COLORS.text }}>{userName(existing.ownerId, profiles)}</b></div>
+            {existing.type === "work" && existing.participants && existing.participants.length > 0 && (
+              <div style={{ marginTop: 3 }}>
+                <span style={{ color: COLORS.textMuted }}>Uczestnicy: </span>
+                {existing.participants.map((p, i) => (
+                  <span key={p.userId}>
+                    {i > 0 && ", "}
+                    <b style={{ color: COLORS.text }}>{userName(p.userId, profiles)}</b>
+                    <span style={{ color: p.status === "accepted" ? COLORS.teal : p.status === "declined" ? COLORS.rose : COLORS.amber }}> ({p.status === "accepted" ? "potwierdził(a)" : p.status === "declined" ? "odrzucił(a)" : "oczekuje"})</span>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <Field label="Rodzaj">
           <div style={{ display: "flex", gap: 8 }}>
             <ChoiceBtn active={form.type === "work"} onClick={() => setForm(f => ({ ...f, type: "work" }))} disabled={!canEdit}>Wspólna praca</ChoiceBtn>
@@ -1245,12 +1294,16 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
                               <div>
                                 <div style={{ fontSize: 10.5, color: COLORS.textMuted, marginBottom: 4 }}>Załoga tego dnia:</div>
                                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                                  {others.map(u => (
-                                    <label key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, cursor: "pointer" }}>
-                                      <input type="checkbox" checked={e.participantIds.includes(u.id)} onChange={() => toggleEntryParticipant(e.date, u.id)} />
-                                      <span style={{ width: 7, height: 7, borderRadius: "50%", background: u.color }} /> {u.name}
-                                    </label>
-                                  ))}
+                                  {others.map(u => {
+                                    const busyThisDay = isUserBusy(u.id, e.date, e.allDay ? "00:00" : e.start, e.allDay ? "23:59" : e.end, null);
+                                    return (
+                                      <label key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, cursor: "pointer" }}>
+                                        <input type="checkbox" checked={e.participantIds.includes(u.id)} onChange={() => toggleEntryParticipant(e.date, u.id)} />
+                                        <span style={{ width: 7, height: 7, borderRadius: "50%", background: u.color }} /> {u.name}
+                                        {busyThisDay && <span style={{ fontSize: 10, color: COLORS.rose, display: "flex", alignItems: "center", gap: 2 }}><Ban size={10} /> zajęty(a) tego dnia — zaznaczenie wyśle zapytanie o akceptację</span>}
+                                      </label>
+                                    );
+                                  })}
                                   {others.length === 0 && <div style={{ fontSize: 11, color: COLORS.textMuted }}>Brak innych zatwierdzonych pracowników.</div>}
                                 </div>
                               </div>
@@ -1282,7 +1335,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
                            : <input type="checkbox" checked={wantsJoinReq} disabled={!canEdit} onChange={() => togglePendingJoin(u.id)} />}
                     <span style={{ width: 8, height: 8, borderRadius: "50%", background: u.color }} />
                     <span style={{ fontSize: 13, flex: 1 }}>{u.name}</span>
-                    {busy && <span style={{ fontSize: 10.5, color: COLORS.rose, display: "flex", alignItems: "center", gap: 3 }}><Ban size={11} /> zajęty(a) — zaznacz, aby wysłać prośbę o zmianę</span>}
+                    {busy && <span style={{ fontSize: 10.5, color: COLORS.rose, display: "flex", alignItems: "center", gap: 3 }}><Ban size={11} /> zajęty(a) — zaznacz, aby wysłać zapytanie o akceptację (dostaniesz powiadomienie o decyzji)</span>}
                   </div>
                 );
               })}
@@ -1307,7 +1360,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
                       <>
                         <span style={{ fontSize: 10.5, color: COLORS.rose, display: "flex", alignItems: "center", gap: 3 }}><Ban size={11} /> zajęty(a)</span>
                         <button onClick={() => { const conflict = conflictEventFor(u.id, existing.date, existing.start, existing.end, existing.id); onRequestJoin(u.id, conflict, existing); }}
-                          style={{ fontSize: 10.5, padding: "3px 7px", borderRadius: 6, border: `1px solid ${COLORS.amber}`, background: "transparent", color: COLORS.amber, cursor: "pointer" }}>Wyślij prośbę</button>
+                          style={{ fontSize: 10.5, padding: "3px 7px", borderRadius: 6, border: `1px solid ${COLORS.amber}`, background: "transparent", color: COLORS.amber, cursor: "pointer" }}>Wyślij zapytanie o akceptację</button>
                       </>
                     ) : (
                       <button onClick={() => onInviteUser(existing, u.id)} style={{ fontSize: 10.5, padding: "3px 7px", borderRadius: 6, border: `1px solid ${COLORS.teal}`, background: "transparent", color: COLORS.teal, cursor: "pointer" }}>Zaproś</button>
@@ -1455,9 +1508,9 @@ function JoinRequestModal({ profiles, data, onClose, onSend }) {
   const [message, setMessage] = useState("");
   const busyUser = profiles.find(u => u.id === data.busyUserId);
   return (
-    <ModalShell onClose={onClose} title="Prośba o zmianę terminu">
+    <ModalShell onClose={onClose} title="Zapytanie o akceptację">
       <div style={{ fontSize: 13, color: COLORS.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
-        <b style={{ color: COLORS.text }}>{busyUser?.name}</b> ma już zaplanowany termin w tym czasie. Możesz wysłać prośbę z pytaniem, czy może zmienić swój termin i dołączyć do Twojego.
+        <b style={{ color: COLORS.text }}>{busyUser?.name}</b> jest zajęty/a w tym terminie. Wyślę zapytanie o akceptację — dostanie powiadomienie i musi je zaakceptować albo odrzucić. Sam/a też dostaniesz powiadomienie o jego/jej decyzji; jeśli odrzuci, będziesz mógł/mogła dopisać kogoś innego.
       </div>
       <Field label="Wiadomość (opcjonalnie)">
         <textarea value={message} onChange={e => setMessage(e.target.value)} rows={3} placeholder="np. Czy mógłbyś/mogłabyś przełożyć swój termin i dołączyć do mnie?"

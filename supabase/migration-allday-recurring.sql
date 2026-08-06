@@ -6,12 +6,16 @@
 -- ---------- 1. Zdarzenia całodniowe ----------
 alter table public.events add column if not exists all_day boolean not null default false;
 
--- dołóż all_day do widoku "zajęty/a" (bez tego cały dzień pokazywał się cudzoziemcom jako 00:00–23:59)
-create or replace view public.event_busy_view as
+-- dołóż all_day do widoku "zajęty/a" (bez tego cały dzień pokazywał się obcym jako 00:00–23:59)
+-- UWAGA: używamy DROP + CREATE (nie CREATE OR REPLACE), bo Postgres nie pozwala
+-- wstawić nowej kolumny w środku istniejącego widoku przez REPLACE.
+drop view if exists public.event_busy_view;
+create view public.event_busy_view as
 select e.id as event_id, e.date, e.start_time, e.end_time, e.all_day, e.owner_id, ep.user_id, ep.status
 from public.events e
 join public.event_participants ep on ep.event_id = e.id
 where ep.status <> 'declined';
+grant select on public.event_busy_view to authenticated;
 
 -- ---------- 2. Cykliczna niedostępność ----------
 create table if not exists public.recurring_blocks (
