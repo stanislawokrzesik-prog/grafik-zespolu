@@ -25,6 +25,7 @@ const RESPONSIVE_CSS = `
 .week-grid { display:grid; grid-template-columns: repeat(7, minmax(140px, 1fr)); gap:10px; overflow-x:auto; }
 @media (max-width: 700px) {
   .week-grid { grid-template-columns: 1fr; overflow-x: visible; gap:8px; }
+  #root { zoom: 1.3; }
 }
 `;
 const GLOBAL_STYLE = FONT_IMPORT + RESPONSIVE_CSS;
@@ -381,15 +382,16 @@ export default function App() {
   // "Seria dat": dowolny, niekoniecznie ciągły zestaw dni (np. urlop, zlecenie na kilka
   // rozstrzelonych dni, albo wspólna praca powtarzająca się przez kilka tygodni).
   // Działa dla obu rodzajów terminu — "Moja niedostępność" i "Wspólna praca".
+  // Każdy wpis w serii (form.entries) ma WŁASNĄ datę, godziny i (dla wspólnej pracy)
+  // własną załogę — to samo zadanie może wystąpić kilka razy z inną ekipą i w innych
+  // godzinach za każdym razem.
   async function createEventSeries(form) {
-    const isAllDay = form.allDay;
-    const startTime = isAllDay ? "00:00" : form.start;
-    const endTime = isAllDay ? "23:59" : form.end;
-    const dates = [...new Set(form.dates)].sort();
-    if (dates.length === 0) return { ok: false, error: "Dodaj co najmniej jeden dzień." };
+    const entries = form.entries || [];
+    if (entries.length === 0) return { ok: false, error: "Dodaj co najmniej jeden dzień." };
 
-    const rows = dates.map(date => ({
-      title: form.title || (form.type === "block" ? "Niedostępny/a" : ""), date, start_time: startTime, end_time: endTime, all_day: isAllDay,
+    const rows = entries.map(e => ({
+      title: form.title || (form.type === "block" ? "Niedostępny/a" : ""), date: e.date,
+      start_time: e.allDay ? "00:00" : e.start, end_time: e.allDay ? "23:59" : e.end, all_day: e.allDay,
       location: form.type === "work" ? (form.location || null) : null, notes: form.notes || null, type: form.type, owner_id: profile.id,
     }));
     const { data: inserted, error } = await supabase.from("events").insert(rows).select();
@@ -399,22 +401,23 @@ export default function App() {
     const notifRows = [];
     let skipped = 0;
     if (form.type === "work") {
-      inserted.forEach(ev => {
-        (form.participantIds || []).forEach(pid => {
+      inserted.forEach((ev, idx) => {
+        const entry = entries[idx];
+        (entry.participantIds || []).forEach(pid => {
           if (pid === profile.id) return;
-          const busy = isUserBusy(pid, ev.date, startTime, endTime, null);
+          const busy = isUserBusy(pid, ev.date, ev.start_time, ev.end_time, null);
           if (busy) { skipped++; return; }
           participantRows.push({ event_id: ev.id, user_id: pid, status: "pending" });
-          notifRows.push({ user_id: pid, type: "invite", message: `${profile.name} zaprasza Cię do wspólnej pracy „${ev.title}” — ${ev.date} ${ev.start_time}–${ev.end_time}${form.location ? " @ " + form.location : ""}.`, event_id: ev.id });
+          notifRows.push({ user_id: pid, type: "invite", message: `${profile.name} zaprasza Cię do wspólnej pracy „${ev.title}” — ${ev.date} ${ev.all_day ? "cały dzień" : `${ev.start_time}–${ev.end_time}`}${form.location ? " @ " + form.location : ""}.`, event_id: ev.id });
         });
       });
     }
     if (participantRows.length) await supabase.from("event_participants").insert(participantRows);
     if (notifRows.length) await supabase.from("notifications").insert(notifRows);
 
-    await logAction("event_created", `${profile.name} dodał(a) serię terminów „${form.title || (form.type === "block" ? "Niedostępny/a" : "")}” na ${dates.length} dni.`);
+    await logAction("event_created", `${profile.name} dodał(a) serię terminów „${form.title || (form.type === "block" ? "Niedostępny/a" : "")}” na ${entries.length} dni.`);
     refreshAll();
-    return { ok: true, count: dates.length, skipped };
+    return { ok: true, count: entries.length, skipped };
   }
 
   async function createRecurringBlock(form) {
@@ -1021,37 +1024,53 @@ function EventCard({ ev, profiles, onClick }) {
 function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, onSubmit, onSubmitSeries, onDelete, isUserBusy, conflictEventFor, onInviteUser, onRequestJoin, onDeleteRecurring }) {
   const [form, setForm] = useState(() => existing ? {
     title: existing.title, date: existing.date, start: existing.start, end: existing.end, allDay: !!existing.allDay,
-    location: existing.location || "", notes: existing.notes || "", type: existing.type, seriesMode: false, dates: [],
+    location: existing.location || "", notes: existing.notes || "", type: existing.type, seriesMode: false, entries: [],
     participantIds: [], pendingJoinUserIds: [], joinMessage: "",
-  } : { title: "", date: defaultDate, start: "09:00", end: "10:00", allDay: false, seriesMode: false, dates: [], location: "", notes: "", type: "work", participantIds: [], pendingJoinUserIds: [], joinMessage: "" });
+  } : { title: "", date: defaultDate, start: "09:00", end: "10:00", allDay: false, seriesMode: false, entries: [], location: "", notes: "", type: "work", participantIds: [], pendingJoinUserIds: [], joinMessage: "" });
   const [seriesDayInput, setSeriesDayInput] = useState(defaultDate || toISODate(new Date()));
   const [seriesRangeFrom, setSeriesRangeFrom] = useState(defaultDate || toISODate(new Date()));
   const [seriesRangeTo, setSeriesRangeTo] = useState(defaultDate || toISODate(new Date()));
   const [seriesError, setSeriesError] = useState("");
   const [seriesResult, setSeriesResult] = useState(null); // {count, skipped} after successful submit
+  const [expandedEntry, setExpandedEntry] = useState(null); // która data ma rozwinięty edytor godzin/załogi
 
   const MAX_SERIES_DAYS_AHEAD = 186; // ~6 miesięcy
   const MAX_SERIES_DATES = 150;
   const maxAllowedDate = toISODate(addDays(new Date(), MAX_SERIES_DAYS_AHEAD));
 
+  // Nowy wpis dziedziczy AKTUALNE domyślne godziny/załogę z formularza — to tylko
+  // punkt startowy, każdy dzień można potem dowolnie nadpisać osobno.
+  function makeEntry(iso) { return { date: iso, start: form.start, end: form.end, allDay: form.allDay, participantIds: [...form.participantIds] }; }
+
   function addSeriesDay(iso) {
     setSeriesError("");
     if (!iso) return;
     if (iso > maxAllowedDate) { setSeriesError("Można planować maksymalnie 6 miesięcy do przodu."); return; }
-    if (form.dates.includes(iso)) return;
-    if (form.dates.length >= MAX_SERIES_DATES) { setSeriesError(`Maksymalnie ${MAX_SERIES_DATES} dni w jednej serii.`); return; }
-    setForm(f => ({ ...f, dates: [...f.dates, iso].sort() }));
+    if (form.entries.some(e => e.date === iso)) return;
+    if (form.entries.length >= MAX_SERIES_DATES) { setSeriesError(`Maksymalnie ${MAX_SERIES_DATES} dni w jednej serii.`); return; }
+    setForm(f => ({ ...f, entries: [...f.entries, makeEntry(iso)].sort((a, b) => a.date.localeCompare(b.date)) }));
   }
   function addSeriesRange(fromIso, toIso) {
     setSeriesError("");
     if (!fromIso || !toIso || toIso < fromIso) { setSeriesError("Zły zakres dat."); return; }
     if (toIso > maxAllowedDate) { setSeriesError("Można planować maksymalnie 6 miesięcy do przodu."); return; }
-    const next = new Set(form.dates);
-    for (let d = new Date(fromIso); d <= new Date(toIso); d.setDate(d.getDate() + 1)) next.add(toISODate(d));
-    if (next.size > MAX_SERIES_DATES) { setSeriesError(`Maksymalnie ${MAX_SERIES_DATES} dni w jednej serii.`); return; }
-    setForm(f => ({ ...f, dates: [...next].sort() }));
+    const existingDates = new Set(form.entries.map(e => e.date));
+    const newEntries = [];
+    for (let d = new Date(fromIso); d <= new Date(toIso); d.setDate(d.getDate() + 1)) {
+      const iso = toISODate(d);
+      if (!existingDates.has(iso)) newEntries.push(makeEntry(iso));
+    }
+    if (form.entries.length + newEntries.length > MAX_SERIES_DATES) { setSeriesError(`Maksymalnie ${MAX_SERIES_DATES} dni w jednej serii.`); return; }
+    setForm(f => ({ ...f, entries: [...f.entries, ...newEntries].sort((a, b) => a.date.localeCompare(b.date)) }));
   }
-  function removeSeriesDay(iso) { setForm(f => ({ ...f, dates: f.dates.filter(d => d !== iso) })); }
+  function removeSeriesDay(iso) { setForm(f => ({ ...f, entries: f.entries.filter(e => e.date !== iso) })); }
+  function updateEntry(iso, patch) { setForm(f => ({ ...f, entries: f.entries.map(e => e.date === iso ? { ...e, ...patch } : e) })); }
+  function toggleEntryParticipant(iso, uid) {
+    setForm(f => ({ ...f, entries: f.entries.map(e => e.date === iso ? { ...e, participantIds: e.participantIds.includes(uid) ? e.participantIds.filter(id => id !== uid) : [...e.participantIds, uid] } : e) }));
+  }
+  function applyDefaultsToAll() {
+    setForm(f => ({ ...f, entries: f.entries.map(e => ({ ...e, start: f.start, end: f.end, allDay: f.allDay, participantIds: [...f.participantIds] })) }));
+  }
 
   // Read-only view for a single occurrence of a recurring unavailability rule —
   // editing one occurrence isn't supported; the whole rule is managed from
@@ -1085,8 +1104,9 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
 
   async function submit() {
     if (form.seriesMode) {
-      if (form.dates.length === 0) { setSeriesError("Dodaj co najmniej jeden dzień do serii."); return; }
-      if (!form.allDay && (!form.start || !form.end)) { setSeriesError("Podaj godziny albo zaznacz „Cały dzień”."); return; }
+      if (form.entries.length === 0) { setSeriesError("Dodaj co najmniej jeden dzień do serii."); return; }
+      const badEntry = form.entries.find(e => !e.allDay && (!e.start || !e.end));
+      if (badEntry) { setSeriesError(`Podaj godziny dla dnia ${badEntry.date} albo zaznacz dla niego „Cały dzień”.`); return; }
       if (form.type === "work" && !form.title.trim()) { setSeriesError("Podaj tytuł terminu."); return; }
       const res = await onSubmitSeries({ ...form, title: form.title.trim() || (form.type === "block" ? "Niedostępny/a" : "") });
       if (res && res.ok) setSeriesResult({ count: res.count, skipped: res.skipped });
@@ -1134,20 +1154,56 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
         )}
 
         {!form.seriesMode ? (
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <Field label="Data" style={{ flex: 1, minWidth: 120 }}>
-              <Input type="date" value={form.date} onChange={v => setForm(f => ({ ...f, date: v }))} disabled={!canEdit} />
-            </Field>
-            {!form.allDay && (
-              <>
-                <Field label="Od" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} disabled={!canEdit} /></Field>
-                <Field label="Do" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} disabled={!canEdit} /></Field>
-              </>
-            )}
-          </div>
+          <>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <Field label="Data" style={{ flex: 1, minWidth: 120 }}>
+                <Input type="date" value={form.date} onChange={v => setForm(f => ({ ...f, date: v }))} disabled={!canEdit} />
+              </Field>
+              {!form.allDay && (
+                <>
+                  <Field label="Od" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} disabled={!canEdit} /></Field>
+                  <Field label="Do" style={{ flex: 1, minWidth: 90 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} disabled={!canEdit} /></Field>
+                </>
+              )}
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.text, cursor: "pointer" }}>
+              <input type="checkbox" checked={form.allDay} onChange={e => setForm(f => ({ ...f, allDay: e.target.checked }))} disabled={!canEdit} />
+              Cały dzień (bez podawania godzin)
+            </label>
+          </>
         ) : (
-          <Field label={`Wybrane dni (${form.dates.length}${form.dates.length ? `, max ${MAX_SERIES_DATES}` : ""})`}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <Field label="Dni w serii">
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Domyślne godziny dla nowo dodawanych dni (każdy dzień można potem zmienić osobno):</div>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, cursor: "pointer" }}>
+                  <input type="checkbox" checked={form.allDay} onChange={e => setForm(f => ({ ...f, allDay: e.target.checked }))} /> Cały dzień
+                </label>
+                {!form.allDay && (
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <Field label="Od" style={{ flex: 1 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} /></Field>
+                    <Field label="Do" style={{ flex: 1 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} /></Field>
+                  </div>
+                )}
+                {form.type === "work" && (
+                  <div>
+                    <div style={{ fontSize: 10.5, color: COLORS.textMuted, marginBottom: 4 }}>Domyślna załoga (możesz zmienić osobno dla każdego dnia niżej):</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {others.map(u => (
+                        <label key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, cursor: "pointer" }}>
+                          <input type="checkbox" checked={form.participantIds.includes(u.id)} onChange={() => toggleParticipant(u.id)} />
+                          <span style={{ width: 7, height: 7, borderRadius: "50%", background: u.color }} /> {u.name}
+                        </label>
+                      ))}
+                      {others.length === 0 && <div style={{ fontSize: 11, color: COLORS.textMuted }}>Brak innych zatwierdzonych pracowników.</div>}
+                    </div>
+                  </div>
+                )}
+                {form.entries.length > 0 && (
+                  <button onClick={applyDefaultsToAll} style={{ ...secondaryBtnStyle(), padding: "6px 10px", fontSize: 11.5, alignSelf: "flex-start" }}>Zastosuj te ustawienia do wszystkich dodanych dni</button>
+                )}
+              </div>
+
               <div style={{ display: "flex", gap: 6, alignItems: "flex-end", flexWrap: "wrap" }}>
                 <div style={{ flex: 1, minWidth: 130 }}><Input type="date" value={seriesDayInput} onChange={setSeriesDayInput} /></div>
                 <button onClick={() => addSeriesDay(seriesDayInput)} style={{ ...secondaryBtnStyle(), padding: "8px 10px", fontSize: 12 }}>+ Dodaj dzień</button>
@@ -1158,30 +1214,57 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
                 <button onClick={() => addSeriesRange(seriesRangeFrom, seriesRangeTo)} style={{ ...secondaryBtnStyle(), padding: "8px 10px", fontSize: 12 }}>+ Dodaj zakres</button>
               </div>
               {seriesError && <div style={{ fontSize: 11.5, color: COLORS.rose }}>{seriesError}</div>}
-              {form.dates.length > 0 && (
-                <div style={{ display: "flex", gap: 5, flexWrap: "wrap", maxHeight: 110, overflowY: "auto", padding: "6px 0" }}>
-                  {form.dates.map(d => (
-                    <span key={d} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, padding: "3px 6px", borderRadius: 6, background: COLORS.bg, border: `1px solid ${COLORS.line}` }}>
-                      {d} <button onClick={() => removeSeriesDay(d)} style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.textMuted, display: "flex", padding: 0 }}><X size={11} /></button>
-                    </span>
-                  ))}
+
+              {form.entries.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 320, overflowY: "auto" }}>
+                  <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>{form.entries.length} dni (max {MAX_SERIES_DATES}) — kliknij dzień, żeby zmienić dla niego godziny{form.type === "work" ? " i załogę" : ""}.</div>
+                  {form.entries.map(e => {
+                    const isOpen = expandedEntry === e.date;
+                    const crewNames = e.participantIds.map(id => profiles.find(p => p.id === id)?.name).filter(Boolean);
+                    return (
+                      <div key={e.date} style={{ border: `1px solid ${COLORS.line}`, borderRadius: 8, background: COLORS.bg, overflow: "hidden" }}>
+                        <div onClick={() => setExpandedEntry(isOpen ? null : e.date)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", cursor: "pointer" }}>
+                          <span style={{ fontSize: 12.5, fontWeight: 600, flex: 1 }}>{e.date}</span>
+                          <span style={{ fontSize: 11, color: COLORS.textMuted }}>{e.allDay ? "Cały dzień" : `${e.start}–${e.end}`}</span>
+                          {form.type === "work" && crewNames.length > 0 && <span style={{ fontSize: 10.5, color: COLORS.teal }}>{crewNames.join(", ")}</span>}
+                          <Pencil size={12} color={COLORS.textMuted} />
+                          <button onClick={(ev) => { ev.stopPropagation(); removeSeriesDay(e.date); }} style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.rose, display: "flex", padding: 0 }}><X size={13} /></button>
+                        </div>
+                        {isOpen && (
+                          <div style={{ padding: "0 10px 10px", display: "flex", flexDirection: "column", gap: 8 }}>
+                            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11.5, cursor: "pointer" }}>
+                              <input type="checkbox" checked={e.allDay} onChange={ev => updateEntry(e.date, { allDay: ev.target.checked })} /> Cały dzień
+                            </label>
+                            {!e.allDay && (
+                              <div style={{ display: "flex", gap: 8 }}>
+                                <Field label="Od" style={{ flex: 1 }}><Input type="time" value={e.start} onChange={v => updateEntry(e.date, { start: v })} /></Field>
+                                <Field label="Do" style={{ flex: 1 }}><Input type="time" value={e.end} onChange={v => updateEntry(e.date, { end: v })} /></Field>
+                              </div>
+                            )}
+                            {form.type === "work" && (
+                              <div>
+                                <div style={{ fontSize: 10.5, color: COLORS.textMuted, marginBottom: 4 }}>Załoga tego dnia:</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {others.map(u => (
+                                    <label key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, cursor: "pointer" }}>
+                                      <input type="checkbox" checked={e.participantIds.includes(u.id)} onChange={() => toggleEntryParticipant(e.date, u.id)} />
+                                      <span style={{ width: 7, height: 7, borderRadius: "50%", background: u.color }} /> {u.name}
+                                    </label>
+                                  ))}
+                                  {others.length === 0 && <div style={{ fontSize: 11, color: COLORS.textMuted }}>Brak innych zatwierdzonych pracowników.</div>}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
-              {!form.allDay && (
-                <div style={{ display: "flex", gap: 8 }}>
-                  <Field label="Godzina od" style={{ flex: 1 }}><Input type="time" value={form.start} onChange={v => setForm(f => ({ ...f, start: v }))} /></Field>
-                  <Field label="Godzina do" style={{ flex: 1 }}><Input type="time" value={form.end} onChange={v => setForm(f => ({ ...f, end: v }))} /></Field>
-                </div>
-              )}
-              <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Te same godziny (albo cały dzień) zostaną zastosowane do każdego wybranego dnia.</div>
             </div>
           </Field>
         )}
-
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.text, cursor: "pointer" }}>
-          <input type="checkbox" checked={form.allDay} onChange={e => setForm(f => ({ ...f, allDay: e.target.checked }))} disabled={!canEdit} />
-          Cały dzień (bez podawania godzin)
-        </label>
 
         {form.type === "work" && <Field label="Lokalizacja"><Input value={form.location} onChange={v => setForm(f => ({ ...f, location: v }))} disabled={!canEdit} placeholder="adres / miejsce" /></Field>}
         <Field label="Notatki"><Input value={form.notes} onChange={v => setForm(f => ({ ...f, notes: v }))} disabled={!canEdit} placeholder="opcjonalnie" /></Field>
@@ -1209,25 +1292,6 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
         )}
         {form.type === "work" && mode === "new" && form.pendingJoinUserIds.length > 0 && (
           <Field label="Wiadomość do zajętych osób (opcjonalnie)"><Input value={form.joinMessage} onChange={v => setForm(f => ({ ...f, joinMessage: v }))} placeholder="np. Czy mógłbyś/mogłabyś przełożyć swój termin?" /></Field>
-        )}
-
-        {form.type === "work" && mode === "new" && form.seriesMode && (
-          <Field label="Z kim dzielisz tę serię">
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {others.map(u => {
-                const checked = form.participantIds.includes(u.id);
-                return (
-                  <div key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 8, background: COLORS.bg, border: `1px solid ${COLORS.line}` }}>
-                    <input type="checkbox" checked={checked} disabled={!canEdit} onChange={() => toggleParticipant(u.id)} />
-                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: u.color }} />
-                    <span style={{ fontSize: 13, flex: 1 }}>{u.name}</span>
-                  </div>
-                );
-              })}
-              {others.length === 0 && <div style={{ fontSize: 12, color: COLORS.textMuted }}>Brak innych zatwierdzonych pracowników.</div>}
-              <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Jeśli ktoś akurat będzie zajęty w konkretnym dniu z serii, zaproszenie na ten jeden dzień zostanie pominięte — resztę dostanie normalnie.</div>
-            </div>
-          </Field>
         )}
 
         {form.type === "work" && existing && (
@@ -1268,7 +1332,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
         )}
 
         <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-          {canEdit && <button onClick={submit} style={primaryBtnStyle()}>{mode === "new" ? (form.seriesMode ? `Utwórz serię (${form.dates.length})` : "Utwórz termin") : "Zapisz zmiany"}</button>}
+          {canEdit && <button onClick={submit} style={primaryBtnStyle()}>{mode === "new" ? (form.seriesMode ? `Utwórz serię (${form.entries.length})` : "Utwórz termin") : "Zapisz zmiany"}</button>}
           {existing && (profile.role === "admin" || existing.ownerId === profile.id) && (
             <button onClick={() => onDelete(existing)} style={{ ...secondaryBtnStyle(), color: COLORS.rose, borderColor: COLORS.rose }}><Trash2 size={14} /> Usuń</button>
           )}
@@ -1281,8 +1345,9 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
 
 function Field({ label, children, style }) { return <div style={style}><div style={{ fontSize: 11, color: COLORS.textMuted, marginBottom: 4, fontWeight: 500 }}>{label}</div>{children}</div>; }
 function Input({ value, onChange, type = "text", placeholder, disabled }) {
+  const isDark = COLORS.bg === DARK_THEME.bg;
   return <input type={type} value={value} placeholder={placeholder} disabled={disabled} onChange={e => onChange(e.target.value)}
-    style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: disabled ? COLORS.panel2 : COLORS.bg, color: COLORS.text, fontSize: 13, outline: "none", boxSizing: "border-box" }} />;
+    style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: disabled ? COLORS.panel2 : COLORS.bg, color: COLORS.text, fontSize: 13, outline: "none", boxSizing: "border-box", colorScheme: isDark ? "dark" : "light" }} />;
 }
 function ChoiceBtn({ active, onClick, children, disabled }) {
   return <button onClick={onClick} disabled={disabled} style={{ flex: 1, padding: "7px 10px", borderRadius: 8, fontSize: 12.5, cursor: disabled ? "default" : "pointer", border: `1px solid ${active ? COLORS.amber : COLORS.line}`, background: active ? COLORS.amber + "22" : "transparent", color: active ? COLORS.text : COLORS.textMuted }}>{children}</button>;
