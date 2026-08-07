@@ -1147,7 +1147,7 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {weeks.map((week, wi) => (
-            <div key={wi} style={{ display: "grid", gridTemplateColumns: colTemplate, gap: 6 }}>
+            <div key={wi} style={{ display: "grid", gridTemplateColumns: colTemplate, gap: 6, alignItems: "stretch" }}>
               {week.map(day => {
                 const iso = toISODate(day);
                 const inMonth = day.getMonth() === currentMonth;
@@ -1155,24 +1155,23 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
               const dayEvents = eventsForDay(iso);
               return (
                 <div key={iso} onClick={() => onDayClick(day)} style={{
-                  cursor: "pointer", minHeight: 84, minWidth: 0, width: "100%", boxSizing: "border-box", borderRadius: 9, padding: 6, background: inMonth ? COLORS.panel : "transparent",
-                  border: `1px solid ${isToday ? COLORS.amber : COLORS.line}`, opacity: inMonth ? 1 : 0.4, display: "flex", flexDirection: "column", overflow: "hidden",
+                  cursor: "pointer", minHeight: 84, minWidth: 0, width: "100%", height: "100%", boxSizing: "border-box", borderRadius: 9, padding: 6, background: inMonth ? COLORS.panel : "transparent",
+                  border: `1px solid ${isToday ? COLORS.amber : COLORS.line}`, opacity: inMonth ? 1 : 0.4, display: "flex", flexDirection: "column", overflowX: "hidden",
                 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                     <span style={{ fontSize: mfs(11), color: isToday ? COLORS.amber : COLORS.textMuted, fontWeight: isToday ? 700 : 500 }}>{day.getDate()}</span>
                     <button onClick={(e) => { e.stopPropagation(); onNewEvent(iso); }} style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer", padding: 0, display: "flex" }}><Plus size={11} /></button>
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4, minWidth: 0 }}>
-                    {dayEvents.slice(0, 3).map(ev => {
+                    {dayEvents.map(ev => {
                       const label = ev.detailed ? (ev.title || "") : "Zajęty/a";
                       const shortLabel = label.length > 15 ? label.slice(0, 15) + "…" : label;
                       return (
-                        <div key={ev.id} style={{ fontSize: mfs(10), borderRadius: 4, padding: "1px 4px", background: COLORS.bg, color: ev.detailed ? COLORS.text : COLORS.textMuted, borderLeft: `2px solid ${userColor(ev.ownerId, profiles)}`, whiteSpace: "normal", wordBreak: "break-word", overflow: "hidden", minWidth: 0 }}>
+                        <div key={ev.id} style={{ fontSize: mfs(10), borderRadius: 4, padding: "1px 4px", background: COLORS.bg, color: ev.detailed ? COLORS.text : COLORS.textMuted, borderLeft: `2px solid ${userColor(ev.ownerId, profiles)}`, whiteSpace: "normal", wordBreak: "break-word", minWidth: 0 }}>
                           {ev.allDay ? "Cały dzień" : ev.start} {shortLabel}
                         </div>
                       );
                     })}
-                    {dayEvents.length > 3 && <div style={{ fontSize: 9.5, color: COLORS.textMuted }}>+{dayEvents.length - 3} więcej</div>}
                   </div>
                 </div>
               );
