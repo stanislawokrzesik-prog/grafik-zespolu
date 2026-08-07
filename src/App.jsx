@@ -25,10 +25,16 @@ const RESPONSIVE_CSS = `
 .week-grid { display:grid; grid-template-columns: repeat(7, minmax(140px, 1fr)); gap:10px; overflow-x:auto; }
 @media (max-width: 700px) {
   .week-grid { grid-template-columns: 1fr; overflow-x: visible; gap:8px; }
-  #root { zoom: 1.3; }
 }
 `;
 const GLOBAL_STYLE = FONT_IMPORT + RESPONSIVE_CSS;
+
+// Mutowalna flaga "telefon" — czytana w komponentach współdzielonych (Input, przyciski,
+// itp.), żeby powiększyć czcionki/przyciski na wąskim ekranie. Zamiast ryzykownego CSS
+// "zoom" (który potrafi łamać przewijanie i pozycjonowanie modali), po prostu zwiększamy
+// realne wartości fontSize/padding w miejscach, gdzie to najbardziej widoczne.
+let IS_MOBILE = typeof window !== "undefined" && window.innerWidth <= 700;
+function mfs(px) { return IS_MOBILE ? Math.round(px * 1.3) : px; } // "mobile font size"
 
 // ---------- date helpers ----------
 function pad(n) { return String(n).padStart(2, "0"); }
@@ -212,6 +218,16 @@ export default function App() {
     await installPrompt.userChoice;
     setInstallPrompt(null);
   }
+
+  const [, forceRerenderOnResize] = useState(0);
+  useEffect(() => {
+    function onResize() {
+      const next = window.innerWidth <= 700;
+      if (next !== IS_MOBILE) { IS_MOBILE = next; forceRerenderOnResize(n => n + 1); }
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   applyTheme(profile?.theme || "dark");
 
@@ -804,8 +820,8 @@ function PendingApprovalScreen({ profile, onLogout }) {
 // ================= TOP NAV =================
 function TopNav({ profile, view, setView, unreadCount, pendingCount, onLogout, onToggleTheme, notifPermission, onRequestNotifPermission, canInstall, onInstall }) {
   const Tab = ({ id, icon: Icon, label, badge }) => (
-    <button onClick={() => setView(id)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 9, background: view === id ? COLORS.panel2 : "transparent", border: "none", color: view === id ? COLORS.text : COLORS.textMuted, cursor: "pointer", fontSize: 13.5, fontWeight: 500, position: "relative", whiteSpace: "nowrap", flexShrink: 0 }}>
-      <Icon size={16} /> {label}
+    <button onClick={() => setView(id)} style={{ display: "flex", alignItems: "center", gap: 6, padding: IS_MOBILE ? "10px 14px" : "8px 12px", borderRadius: 9, background: view === id ? COLORS.panel2 : "transparent", border: "none", color: view === id ? COLORS.text : COLORS.textMuted, cursor: "pointer", fontSize: mfs(13.5), fontWeight: 500, position: "relative", whiteSpace: "nowrap", flexShrink: 0 }}>
+      <Icon size={IS_MOBILE ? 19 : 16} /> {label}
       {badge > 0 && <span style={{ position: "absolute", top: -4, right: -4, background: COLORS.rose, color: "#fff", fontSize: 10, borderRadius: 8, minWidth: 16, height: 16, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 3px" }}>{badge}</span>}
     </button>
   );
@@ -966,7 +982,7 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
             {week.map(day => {
               const iso = toISODate(day);
               const inMonth = day.getMonth() === currentMonth;
-              const isToday = iso === todayIso;
+              const isToday = inMonth && iso === todayIso;
               const dayEvents = eventsForDay(iso);
               return (
                 <div key={iso} onClick={() => onDayClick(day)} style={{
@@ -1010,7 +1026,7 @@ function YearView({ anchorDate, profiles, eventsForDay, onMonthClick, onDayClick
               {weeks.flat().map((day, i) => {
                 const iso = toISODate(day);
                 const inMonth = day.getMonth() === mi;
-                const isToday = iso === todayIso;
+                const isToday = inMonth && iso === todayIso;
                 const dayEvs = inMonth ? eventsForDay(iso) : [];
                 const ownerColors = [...new Set(dayEvs.map(e => e.ownerId))].map(id => userColor(id, profiles)).slice(0, 4);
                 return (
@@ -1046,8 +1062,8 @@ function EventCard({ ev, profiles, onClick }) {
   if (!ev.detailed) {
     return (
       <div title="Zajęty/a — szczegóły widzi tylko właściciel terminu i admin" style={{ borderRadius: 8, padding: "7px 9px", background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderLeftWidth: 3, borderLeftColor: ownerColor, opacity: 0.85 }}>
-        <div style={{ fontSize: 11, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {timeLabel} {ev.recurring && <Repeat size={10} />}</div>
-        <div style={{ fontSize: 12.5, fontWeight: 600, margin: "2px 0", color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 5 }}><Ban size={11} /> Zajęty/a</div>
+        <div style={{ fontSize: mfs(11), color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {timeLabel} {ev.recurring && <Repeat size={10} />}</div>
+        <div style={{ fontSize: mfs(12.5), fontWeight: 600, margin: "2px 0", color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 5 }}><Ban size={11} /> Zajęty/a</div>
         <div style={{ display: "flex", gap: 3, marginTop: 5, flexWrap: "wrap" }}>
           {ev.participants.filter(p => p.status !== "declined").map(p => (
             <span key={p.userId} title={userName(p.userId, profiles)} style={{ width: 8, height: 8, borderRadius: "50%", background: userColor(p.userId, profiles) }} />
@@ -1058,8 +1074,8 @@ function EventCard({ ev, profiles, onClick }) {
   }
   return (
     <div onClick={onClick} style={{ cursor: "pointer", borderRadius: 8, padding: "7px 9px", background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderLeftWidth: 3, borderLeftColor: ownerColor }}>
-      <div style={{ fontSize: 11, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {timeLabel} {ev.recurring && <Repeat size={10} />}</div>
-      <div style={{ fontSize: 12.5, fontWeight: 600, margin: "2px 0", color: isBlock ? COLORS.textMuted : COLORS.text, fontStyle: isBlock ? "italic" : "normal" }}>{isBlock ? "🚫 " : ""}{ev.title}</div>
+      <div style={{ fontSize: mfs(11), color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {timeLabel} {ev.recurring && <Repeat size={10} />}</div>
+      <div style={{ fontSize: mfs(12.5), fontWeight: 600, margin: "2px 0", color: isBlock ? COLORS.textMuted : COLORS.text, fontStyle: isBlock ? "italic" : "normal" }}>{isBlock ? "🚫 " : ""}{ev.title}</div>
       {ev.location && <div style={{ fontSize: 10.5, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 3 }}><MapPin size={9} /> {ev.location}</div>}
       {!isBlock && (
         <div style={{ display: "flex", gap: 3, marginTop: 5, flexWrap: "wrap" }}>
@@ -1307,25 +1323,33 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
                     const crew = e.participantIds.map(id => {
                       const u = profiles.find(p => p.id === id);
                       const busy = isUserBusy(id, e.date, e.allDay ? "00:00" : e.start, e.allDay ? "23:59" : e.end, null);
-                      return u ? { name: u.name, busy } : null;
+                      return u ? { id, name: u.name, busy } : null;
                     }).filter(Boolean);
                     const hasConflict = crew.some(c => c.busy);
                     return (
                       <div key={e.date} style={{ border: `1px solid ${hasConflict ? COLORS.rose : COLORS.line}`, borderRadius: 8, background: COLORS.bg, overflow: "hidden" }}>
-                        <div onClick={() => setExpandedEntry(isOpen ? null : e.date)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", cursor: "pointer", flexWrap: "wrap" }}>
-                          {hasConflict && <AlertTriangle size={13} color={COLORS.rose} />}
-                          <span style={{ fontSize: 12.5, fontWeight: 600 }}>{e.date}</span>
-                          <span style={{ fontSize: 11, color: COLORS.textMuted }}>{e.allDay ? "Cały dzień" : `${e.start}–${e.end}`}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", flexWrap: "wrap" }}>
+                          {hasConflict && <AlertTriangle size={13} color={COLORS.rose} style={{ flexShrink: 0 }} />}
+                          <span onClick={() => setExpandedEntry(isOpen ? null : e.date)} style={{ fontSize: mfs(12.5), fontWeight: 600, cursor: "pointer" }}>{e.date}</span>
+                          <span onClick={() => setExpandedEntry(isOpen ? null : e.date)} style={{ fontSize: mfs(11), color: COLORS.textMuted, cursor: "pointer" }}>{e.allDay ? "Cały dzień" : `${e.start}–${e.end}`}</span>
                           {form.type === "work" && crew.length > 0 && (
-                            <span style={{ fontSize: 10.5, marginLeft: "auto", marginRight: 4 }}>
-                              {crew.map((c, i) => (
-                                <span key={i} style={{ color: c.busy ? COLORS.rose : COLORS.teal }}>{i > 0 && ", "}{c.name}{c.busy ? " (zajęty/a)" : ""}</span>
+                            <span style={{ display: "flex", flexWrap: "wrap", gap: 4, marginLeft: "auto" }}>
+                              {crew.map(c => (
+                                <span key={c.id} style={{ display: "flex", alignItems: "center", gap: 3, fontSize: mfs(10.5), padding: "2px 5px", borderRadius: 5, background: c.busy ? COLORS.rose + "22" : COLORS.teal + "22", color: c.busy ? COLORS.rose : COLORS.teal }}>
+                                  {c.name}{c.busy ? " ⚠" : ""}
+                                  <button onClick={(ev) => { ev.stopPropagation(); toggleEntryParticipant(e.date, c.id); }} title="Usuń z tego dnia" style={{ background: "none", border: "none", cursor: "pointer", color: "inherit", display: "flex", padding: 0 }}><X size={10} /></button>
+                                </span>
                               ))}
                             </span>
                           )}
-                          <Pencil size={12} color={COLORS.textMuted} style={{ marginLeft: form.type === "work" && crew.length > 0 ? 0 : "auto" }} />
-                          <button onClick={(ev) => { ev.stopPropagation(); removeSeriesDay(e.date); }} style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.rose, display: "flex", padding: 0 }}><X size={13} /></button>
+                          <Pencil size={13} color={COLORS.textMuted} onClick={() => setExpandedEntry(isOpen ? null : e.date)} style={{ cursor: "pointer", flexShrink: 0 }} />
+                          <button onClick={() => removeSeriesDay(e.date)} title="Usuń ten dzień z serii" style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.rose, display: "flex", padding: 0, flexShrink: 0 }}><X size={14} /></button>
                         </div>
+                        {hasConflict && (
+                          <div style={{ padding: "0 10px 8px", fontSize: mfs(10.5), color: COLORS.rose }}>
+                            Po utworzeniu serii zostanie automatycznie wysłane zapytanie o akceptację do zajętej osoby. Możesz też kliknąć „×” przy jej imieniu, żeby ją usunąć z tego dnia i dodać kogoś wolnego (przycisk ✏️).
+                          </div>
+                        )}
                         {isOpen && (
                           <div style={{ padding: "0 10px 10px", display: "flex", flexDirection: "column", gap: 8 }}>
                             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11.5, cursor: "pointer" }}>
@@ -1444,25 +1468,25 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
   );
 }
 
-function Field({ label, children, style }) { return <div style={style}><div style={{ fontSize: 11, color: COLORS.textMuted, marginBottom: 4, fontWeight: 500 }}>{label}</div>{children}</div>; }
+function Field({ label, children, style }) { return <div style={style}><div style={{ fontSize: mfs(11), color: COLORS.textMuted, marginBottom: 4, fontWeight: 500 }}>{label}</div>{children}</div>; }
 function Input({ value, onChange, type = "text", placeholder, disabled }) {
   const isDark = COLORS.bg === DARK_THEME.bg;
   return <input type={type} value={value} placeholder={placeholder} disabled={disabled} onChange={e => onChange(e.target.value)}
-    style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: disabled ? COLORS.panel2 : COLORS.bg, color: COLORS.text, fontSize: 13, outline: "none", boxSizing: "border-box", colorScheme: isDark ? "dark" : "light" }} />;
+    style={{ width: "100%", padding: IS_MOBILE ? "11px 12px" : "8px 10px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: disabled ? COLORS.panel2 : COLORS.bg, color: COLORS.text, fontSize: mfs(13), outline: "none", boxSizing: "border-box", colorScheme: isDark ? "dark" : "light" }} />;
 }
 function ChoiceBtn({ active, onClick, children, disabled }) {
-  return <button onClick={onClick} disabled={disabled} style={{ flex: 1, padding: "7px 10px", borderRadius: 8, fontSize: 12.5, cursor: disabled ? "default" : "pointer", border: `1px solid ${active ? COLORS.amber : COLORS.line}`, background: active ? COLORS.amber + "22" : "transparent", color: active ? COLORS.text : COLORS.textMuted }}>{children}</button>;
+  return <button onClick={onClick} disabled={disabled} style={{ flex: 1, padding: IS_MOBILE ? "10px 12px" : "7px 10px", borderRadius: 8, fontSize: mfs(12.5), cursor: disabled ? "default" : "pointer", border: `1px solid ${active ? COLORS.amber : COLORS.line}`, background: active ? COLORS.amber + "22" : "transparent", color: active ? COLORS.text : COLORS.textMuted }}>{children}</button>;
 }
-function primaryBtnStyle() { return { padding: "9px 16px", borderRadius: 9, border: "none", background: COLORS.amber, color: "#12141C", fontWeight: 600, fontSize: 13, cursor: "pointer" }; }
-function secondaryBtnStyle() { return { padding: "9px 14px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.text, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }; }
+function primaryBtnStyle() { return { padding: IS_MOBILE ? "12px 18px" : "9px 16px", borderRadius: 9, border: "none", background: COLORS.amber, color: "#12141C", fontWeight: 600, fontSize: mfs(13), cursor: "pointer" }; }
+function secondaryBtnStyle() { return { padding: IS_MOBILE ? "12px 16px" : "9px 14px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.text, fontSize: mfs(13), cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }; }
 
 function ModalShell({ onClose, title, children }) {
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "#00000099", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 }}>
-      <div onClick={e => e.stopPropagation()} style={{ width: 440, maxHeight: "85vh", overflowY: "auto", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, padding: 20, fontFamily: "Inter, sans-serif" }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: 440, maxWidth: "94vw", maxHeight: "85vh", overflowY: "auto", WebkitOverflowScrolling: "touch", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, padding: 20, fontFamily: "Inter, sans-serif" }}>
         <div style={{ display: "flex", alignItems: "center", marginBottom: 14 }}>
-          <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: 16 }}>{title}</div>
-          <button onClick={onClose} style={{ marginLeft: "auto", background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer" }}><X size={18} /></button>
+          <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: mfs(16) }}>{title}</div>
+          <button onClick={onClose} style={{ marginLeft: "auto", background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer" }}><X size={20} /></button>
         </div>
         {children}
       </div>
