@@ -27,6 +27,7 @@ create table if not exists public.events (
   notes text,
   type text not null default 'work' check (type in ('work','block')),
   owner_id uuid not null references public.profiles(id) on delete cascade,
+  series_id uuid,
   created_at timestamptz not null default now()
 );
 
@@ -142,7 +143,13 @@ grant select on public.event_busy_view to authenticated;
 create policy "participants_select" on public.event_participants for select using (public.is_approved());
 create policy "participants_insert" on public.event_participants for insert with check (public.is_approved());
 create policy "participants_update" on public.event_participants for update using (public.is_approved() and (user_id = auth.uid() or public.is_admin()));
-create policy "participants_delete" on public.event_participants for delete using (public.is_approved() and (user_id = auth.uid() or public.is_admin()));
+create policy "participants_delete" on public.event_participants for delete using (
+  public.is_approved() and (
+    user_id = auth.uid()
+    or public.is_admin()
+    or exists (select 1 from public.events e where e.id = event_participants.event_id and e.owner_id = auth.uid())
+  )
+);
 
 -- notifications: każdy widzi/oznacza/usuwa tylko swoje; wysyłać (insert) może każdy zatwierdzony
 create policy "notifications_select" on public.notifications for select using (user_id = auth.uid() or public.is_admin());
@@ -178,6 +185,7 @@ create table if not exists public.recurring_blocks (
   end_time text,
   date_from date not null,
   date_until date,
+  exception_dates date[] not null default '{}',
   created_at timestamptz not null default now()
 );
 alter table public.recurring_blocks enable row level security;
@@ -187,7 +195,7 @@ create policy "recurring_update" on public.recurring_blocks for update using (us
 create policy "recurring_delete" on public.recurring_blocks for delete using (user_id = auth.uid() or public.is_admin());
 
 create or replace view public.recurring_busy_view as
-select id, user_id, weekdays, all_day, start_time, end_time, date_from, date_until
+select id, user_id, weekdays, all_day, start_time, end_time, date_from, date_until, exception_dates
 from public.recurring_blocks;
 grant select on public.recurring_busy_view to authenticated;
 
@@ -209,6 +217,7 @@ create policy "push_sub_delete" on public.push_subscriptions for delete using (u
 create table if not exists public.app_settings (
   id text primary key default 'default',
   buffer_minutes int not null default 120,
+  capacity_alert_threshold int not null default 35,
   updated_at timestamptz not null default now()
 );
 insert into public.app_settings (id, buffer_minutes) values ('default', 120) on conflict (id) do nothing;

@@ -47,6 +47,27 @@ function urlBase64ToUint8Array(base64String) {
   for (let i = 0; i < rawData.length; i++) output[i] = rawData.charCodeAt(i);
   return output;
 }
+// Wykorzystanie kalendarza w najbliższych `days` dniach: suma godzin "wspólnej pracy"
+// (na osobę) podzielona przez teoretyczną pojemność zespołu (liczba zatwierdzonych
+// osób × godziny dziennie × liczba dni). Prosta, przejrzysta metryka — nie uwzględnia
+// nieobecności (te już naturalnie zmniejszają dostępność, ale nie odejmujemy ich z
+// mianownika, żeby procent był łatwy do wytłumaczenia).
+function computeCapacityPct(events, profiles, days, hoursPerDay) {
+  const approvedCount = profiles.filter(p => p.approved).length;
+  if (approvedCount === 0) return null;
+  const capacityHours = approvedCount * days * hoursPerDay;
+  const todayIso = toISODate(new Date());
+  const windowEndIso = toISODate(addDays(new Date(), days));
+  let bookedHours = 0;
+  events.forEach(ev => {
+    if (ev.type !== "work" || !ev.detailed) return;
+    if (ev.date < todayIso || ev.date > windowEndIso) return;
+    const durH = ev.allDay ? hoursPerDay : (timeToMin(ev.end) - timeToMin(ev.start)) / 60;
+    const activeParticipants = (ev.participants || []).filter(p => p.status !== "declined").length;
+    bookedHours += Math.max(0, durH) * activeParticipants;
+  });
+  return (bookedHours / capacityHours) * 100;
+}
 function startOfWeek(d) { const date = new Date(d); const day = (date.getDay() + 6) % 7; date.setDate(date.getDate() - day); date.setHours(0, 0, 0, 0); return date; }
 function addDays(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
 function addMonths(d, n) { const r = new Date(d); r.setDate(1); r.setMonth(r.getMonth() + n); return r; }
@@ -95,7 +116,7 @@ async function fetchEvents(isAdmin) {
   if (error) throw error;
   const detailed = (data || []).map(e => ({
     id: e.id, title: e.title, date: e.date, start: e.start_time, end: e.end_time, allDay: e.all_day,
-    location: e.location, notes: e.notes, type: e.type, ownerId: e.owner_id,
+    location: e.location, notes: e.notes, type: e.type, ownerId: e.owner_id, seriesId: e.series_id,
     participants: (e.event_participants || []).map(p => ({ userId: p.user_id, status: p.status })),
     detailed: true, recurring: false,
   }));
@@ -120,7 +141,8 @@ async function fetchRecurringBlocks(isAdmin) {
   if (error) throw error;
   const detailed = (data || []).map(r => ({
     id: r.id, userId: r.user_id, label: r.label, weekdays: r.weekdays, allDay: r.all_day,
-    start: r.start_time, end: r.end_time, dateFrom: r.date_from, dateUntil: r.date_until, detailed: true,
+    start: r.start_time, end: r.end_time, dateFrom: r.date_from, dateUntil: r.date_until,
+    exceptionDates: r.exception_dates || [], detailed: true,
   }));
   if (isAdmin) return detailed;
 
@@ -129,7 +151,8 @@ async function fetchRecurringBlocks(isAdmin) {
   const detailedIds = new Set(detailed.map(r => r.id));
   const minimal = (busyRows || []).filter(r => !detailedIds.has(r.id)).map(r => ({
     id: r.id, userId: r.user_id, label: null, weekdays: r.weekdays, allDay: r.all_day,
-    start: r.start_time, end: r.end_time, dateFrom: r.date_from, dateUntil: r.date_until, detailed: false,
+    start: r.start_time, end: r.end_time, dateFrom: r.date_from, dateUntil: r.date_until,
+    exceptionDates: r.exception_dates || [], detailed: false,
   }));
   return [...detailed, ...minimal];
 }
@@ -142,10 +165,12 @@ function expandRecurringBlocks(rules, windowStartISO, windowEndISO) {
     const from = new Date(Math.max(new Date(rule.dateFrom), winStart));
     const until = rule.dateUntil ? new Date(Math.min(new Date(rule.dateUntil), winEnd)) : winEnd;
     if (from > until) return;
+    const exceptions = new Set(rule.exceptionDates || []);
     for (let d = new Date(from); d <= until; d.setDate(d.getDate() + 1)) {
       const weekday = (d.getDay() + 6) % 7; // 0=Mon..6=Sun
       if (!rule.weekdays.includes(weekday)) continue;
       const iso = toISODate(d);
+      if (exceptions.has(iso)) continue;
       out.push({
         id: `rec-${rule.id}-${iso}`, date: iso, start: rule.allDay ? "00:00" : rule.start, end: rule.allDay ? "23:59" : rule.end,
         allDay: rule.allDay, ownerId: rule.userId, type: "block", title: rule.detailed ? (rule.label || "Niedostępność cykliczna") : null,
@@ -436,10 +461,12 @@ export default function App() {
     const entries = form.entries || [];
     if (entries.length === 0) return { ok: false, error: "Dodaj co najmniej jeden dzień." };
 
+    const seriesId = crypto.randomUUID ? crypto.randomUUID() : genId("series");
     const rows = entries.map(e => ({
       title: form.title || (form.type === "block" ? "Niedostępny/a" : ""), date: e.date,
       start_time: e.allDay ? "00:00" : e.start, end_time: e.allDay ? "23:59" : e.end, all_day: e.allDay,
       location: form.type === "work" ? (form.location || null) : null, notes: form.notes || null, type: form.type, owner_id: profile.id,
+      series_id: seriesId,
     }));
     const { data: inserted, error } = await supabase.from("events").insert(rows).select();
     if (error) { console.error(error); return { ok: false, error: error.message }; }
@@ -499,6 +526,60 @@ export default function App() {
     await logAction("recurring_deleted", `${profile.name} usunął(-ęła) cykliczną niedostępność${rule.label ? ` „${rule.label}”` : ""}.`);
     refreshAll();
   }
+  // Usuwanie wystąpienia/wystąpień z reguły cyklicznej z wyborem zakresu:
+  // "this" = tylko ten dzień (wyjątek), "future" = ten i przyszłe (skraca regułę),
+  // "past" = ten i poprzednie (przesuwa początek reguły), "all" = cała reguła.
+  async function deleteRecurringOccurrence(ruleId, occurrenceDate, scope) {
+    const rule = recurringBlocks.find(r => r.id === ruleId);
+    if (!rule) return;
+    if (scope === "all") {
+      await supabase.from("recurring_blocks").delete().eq("id", ruleId);
+    } else if (scope === "this") {
+      const next = [...new Set([...(rule.exceptionDates || []), occurrenceDate])];
+      await supabase.from("recurring_blocks").update({ exception_dates: next }).eq("id", ruleId);
+    } else if (scope === "future") {
+      const dayBefore = toISODate(addDays(new Date(occurrenceDate), -1));
+      await supabase.from("recurring_blocks").update({ date_until: dayBefore }).eq("id", ruleId);
+    } else if (scope === "past") {
+      await supabase.from("recurring_blocks").update({ date_from: occurrenceDate }).eq("id", ruleId);
+    }
+    await logAction("recurring_deleted", `${profile.name} usunął(-ęła) wystąpienia (${scope}) reguły${rule.label ? ` „${rule.label}”` : ""} od ${occurrenceDate}.`);
+    refreshAll();
+  }
+  // Edycja reguły cyklicznej: "this" nadpisuje tylko jeden dzień (wyjątek + zwykły
+  // pojedynczy termin na to miejsce), "future" dzieli regułę na dwie (stara kończy się
+  // dzień wcześniej, nowa z edytowanymi danymi startuje od tego dnia), "all" nadpisuje
+  // całą regułę.
+  async function editRecurringOccurrence(ruleId, occurrenceDate, scope, fields) {
+    const rule = recurringBlocks.find(r => r.id === ruleId);
+    if (!rule) return;
+    if (scope === "this") {
+      const next = [...new Set([...(rule.exceptionDates || []), occurrenceDate])];
+      await supabase.from("recurring_blocks").update({ exception_dates: next }).eq("id", ruleId);
+      const isAllDay = fields.allDay;
+      const { data: ev } = await supabase.from("events").insert({
+        title: fields.label || rule.label || "Niedostępny/a", date: occurrenceDate,
+        start_time: isAllDay ? "00:00" : fields.start, end_time: isAllDay ? "23:59" : fields.end, all_day: isAllDay,
+        type: "block", owner_id: rule.userId,
+      }).select().single();
+      if (ev) await supabase.from("event_participants").insert({ event_id: ev.id, user_id: rule.userId, status: "accepted" });
+    } else if (scope === "future") {
+      const dayBefore = toISODate(addDays(new Date(occurrenceDate), -1));
+      await supabase.from("recurring_blocks").update({ date_until: dayBefore }).eq("id", ruleId);
+      await supabase.from("recurring_blocks").insert({
+        user_id: rule.userId, label: fields.label || rule.label, weekdays: rule.weekdays,
+        all_day: fields.allDay, start_time: fields.allDay ? null : fields.start, end_time: fields.allDay ? null : fields.end,
+        date_from: occurrenceDate, date_until: rule.dateUntil || null,
+      });
+    } else {
+      await supabase.from("recurring_blocks").update({
+        label: fields.label || rule.label, all_day: fields.allDay,
+        start_time: fields.allDay ? null : fields.start, end_time: fields.allDay ? null : fields.end,
+      }).eq("id", ruleId);
+    }
+    await logAction("recurring_created", `${profile.name} zmodyfikował(a) (${scope}) regułę cykliczną${rule.label ? ` „${rule.label}”` : ""} od ${occurrenceDate}.`);
+    refreshAll();
+  }
 
   async function updateEvent(updated) {
     const isAllDay = updated.allDay;
@@ -526,10 +607,42 @@ export default function App() {
     refreshAll();
   }
 
+  // Grupowe usuwanie terminów z tej samej "serii dat": ten dzień / ten i przyszłe /
+  // poprzednie / wszystkie — liczone względem daty terminu, z którego wywołano akcję.
+  async function deleteEventSeries(ev, scope) {
+    const members = events.filter(e => e.seriesId && e.seriesId === ev.seriesId && e.detailed);
+    let targets;
+    if (scope === "this") targets = [ev];
+    else if (scope === "future") targets = members.filter(e => e.date >= ev.date);
+    else if (scope === "past") targets = members.filter(e => e.date <= ev.date);
+    else targets = members; // all
+    for (const t of targets) {
+      if (t.type === "work" && t.participants) {
+        const others = t.participants.filter(p => p.userId !== profile.id && p.status !== "declined");
+        for (const p of others) {
+          await pushNotification(p.userId, "event_cancelled", `${profile.name} odwołał(a) termin „${t.title || "(bez tytułu)"}” (${t.date} ${t.allDay ? "cały dzień" : `${t.start}–${t.end}`}).`, { eventId: t.id });
+        }
+      }
+    }
+    await supabase.from("events").delete().in("id", targets.map(t => t.id));
+    await logAction("event_deleted", `${profile.name} usunął(-ęła) ${targets.length} termin(ów) z serii „${ev.title || "(bez tytułu)"}” (zakres: ${scope}).`);
+    setShowEditEvent(null);
+    refreshAll();
+  }
+
   async function inviteToExistingEvent(ev, userId) {
     await supabase.from("event_participants").upsert({ event_id: ev.id, user_id: userId, status: "pending" });
     await pushNotification(userId, "invite", `${profile.name} zaprasza Cię do wspólnej pracy „${ev.title}” — ${ev.date} ${ev.start}–${ev.end}${ev.location ? " @ " + ev.location : ""}.`, { eventId: ev.id });
     await logAction("invite_sent", `${profile.name} zaprosił(a) ${userName(userId, profiles)} do „${ev.title}”.`);
+    refreshAll();
+  }
+
+  // Admin/właściciel może usunąć KOGOKOLWIEK z terminu, niezależnie od statusu
+  // (np. ktoś dodany omyłkowo, albo omyłkowo zaakceptował) — i od razu dodać kogoś innego.
+  async function removeParticipant(ev, userId) {
+    await supabase.from("event_participants").delete().eq("event_id", ev.id).eq("user_id", userId);
+    await pushNotification(userId, "event_cancelled", `${profile.name} usunął(-ęła) Cię z terminu „${ev.title}” (${ev.date} ${ev.allDay ? "cały dzień" : `${ev.start}–${ev.end}`}).`, { eventId: ev.id });
+    await logAction("participant_removed", `${profile.name} usunął(-ęła) ${userName(userId, profiles)} z „${ev.title}”.`);
     refreshAll();
   }
 
@@ -603,7 +716,55 @@ export default function App() {
     await logAction("buffer_updated", `${profile.name} ustawił(a) bufor czasowy między zadaniami na ${minutes} min.`);
   }
 
-  const myNotifs = profile ? notifications.filter(n => n.userId === profile.id).sort((a, b) => b.timestamp - a.timestamp) : [];
+  // ---------- kopia zapasowa ----------
+  async function exportBackup() {
+    const [ev, ep, rb] = await Promise.all([
+      supabase.from("events").select("*"),
+      supabase.from("event_participants").select("*"),
+      supabase.from("recurring_blocks").select("*"),
+    ]);
+    const payload = {
+      version: 1, exportedAt: new Date().toISOString(), exportedBy: profile.name,
+      events: ev.data || [], event_participants: ep.data || [], recurring_blocks: rb.data || [],
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `grafik-kopia-zapasowa-${toISODate(new Date())}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    await logAction("backup_exported", `${profile.name} wyeksportował(a) kopię zapasową (${payload.events.length} terminów).`);
+  }
+  async function importBackup(file) {
+    const text = await file.text();
+    let data;
+    try { data = JSON.parse(text); } catch (e) { return { ok: false, error: "To nie jest poprawny plik JSON." }; }
+    try {
+      if (data.events?.length) { const { error } = await supabase.from("events").upsert(data.events, { onConflict: "id" }); if (error) throw error; }
+      if (data.event_participants?.length) { const { error } = await supabase.from("event_participants").upsert(data.event_participants, { onConflict: "event_id,user_id" }); if (error) throw error; }
+      if (data.recurring_blocks?.length) { const { error } = await supabase.from("recurring_blocks").upsert(data.recurring_blocks, { onConflict: "id" }); if (error) throw error; }
+    } catch (e) { return { ok: false, error: e.message }; }
+    await logAction("backup_imported", `${profile.name} zaimportował(a) kopię zapasową (${data.events?.length || 0} terminów).`);
+    refreshAll();
+    return { ok: true, count: data.events?.length || 0 };
+  }
+
+  // ---------- alert wykorzystania kalendarza (>35%) ----------
+  const capacityAlertRef = useRef(false);
+  useEffect(() => {
+    if (!profile || profile.role !== "admin" || events.length === 0 || profiles.length === 0) return;
+    const pct = computeCapacityPct(events, profiles, 30, 8);
+    if (pct === null) return;
+    if (pct > 35 && !capacityAlertRef.current) {
+      const recentAlert = notifications.find(n => n.userId === profile.id && n.type === "capacity_alert" && (Date.now() - n.timestamp) < 20 * 60 * 60 * 1000);
+      if (!recentAlert) {
+        pushNotification(profile.id, "capacity_alert", `Kalendarz zespołu jest wypełniony w ${pct.toFixed(0)}% w najbliższych 30 dniach (próg ostrzegawczy: 35%). Sprawdź obciążenie w Panelu admina.`);
+      }
+      capacityAlertRef.current = true;
+    } else if (pct <= 35) {
+      capacityAlertRef.current = false;
+    }
+  }, [events, profiles, profile]); // eslint-disable-line  const myNotifs = profile ? notifications.filter(n => n.userId === profile.id).sort((a, b) => b.timestamp - a.timestamp) : [];
   const unreadCount = myNotifs.filter(n => !n.read).length;
   const pendingCount = profiles.filter(p => !p.approved).length;
 
@@ -655,6 +816,7 @@ export default function App() {
             onSendPasswordReset={adminSendPasswordReset}
             onDeleteEvent={deleteEvent} onEditEvent={(ev) => setShowEditEvent(ev)}
             bufferMinutes={bufferMinutes} onSetBufferMinutes={adminSetBufferMinutes}
+            onExportBackup={exportBackup} onImportBackup={importBackup}
           />
         )}
       </div>
@@ -667,8 +829,9 @@ export default function App() {
       {showEditEvent && (
         <EventModal mode="edit" profiles={profiles} profile={profile} existing={showEditEvent}
           onClose={() => setShowEditEvent(null)} isUserBusy={isUserBusy} conflictEventFor={conflictEventFor}
-          onSubmit={updateEvent} onDelete={deleteEvent} onInviteUser={inviteToExistingEvent}
-          onDeleteRecurring={deleteRecurringBlock}
+          onSubmit={updateEvent} onDelete={deleteEvent} onInviteUser={inviteToExistingEvent} onRemoveParticipant={removeParticipant}
+          onDeleteRecurring={deleteRecurringBlock} onDeleteRecurringOccurrence={deleteRecurringOccurrence} onEditRecurringOccurrence={editRecurringOccurrence}
+          onDeleteSeries={deleteEventSeries}
           onRequestJoin={(busyUserId, conflictEvent, draftEvent) => setShowJoinReq({ busyUserId, conflictEvent, draftEvent })} />
       )}
       {showJoinReq && <JoinRequestModal profiles={profiles} data={showJoinReq} onClose={() => setShowJoinReq(null)} onSend={sendJoinRequest} />}
@@ -972,13 +1135,13 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
   const currentMonth = anchorDate.getMonth();
   const todayIso = toISODate(new Date());
   return (
-    <div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6, marginBottom: 6 }}>
-        {DAY_NAMES.map(d => <div key={d} style={{ fontSize: 11, color: COLORS.textMuted, textAlign: "center", fontWeight: 600 }}>{d}</div>)}
+    <div style={{ width: "100%" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6, marginBottom: 6 }}>
+        {DAY_NAMES.map(d => <div key={d} style={{ fontSize: mfs(11), color: COLORS.textMuted, textAlign: "center", fontWeight: 600 }}>{d}</div>)}
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {weeks.map((week, wi) => (
-          <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+          <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
             {week.map(day => {
               const iso = toISODate(day);
               const inMonth = day.getMonth() === currentMonth;
@@ -986,19 +1149,23 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
               const dayEvents = eventsForDay(iso);
               return (
                 <div key={iso} onClick={() => onDayClick(day)} style={{
-                  cursor: "pointer", minHeight: 84, borderRadius: 9, padding: 6, background: inMonth ? COLORS.panel : "transparent",
-                  border: `1px solid ${isToday ? COLORS.amber : COLORS.line}`, opacity: inMonth ? 1 : 0.4, display: "flex", flexDirection: "column",
+                  cursor: "pointer", minHeight: 84, minWidth: 0, width: "100%", boxSizing: "border-box", borderRadius: 9, padding: 6, background: inMonth ? COLORS.panel : "transparent",
+                  border: `1px solid ${isToday ? COLORS.amber : COLORS.line}`, opacity: inMonth ? 1 : 0.4, display: "flex", flexDirection: "column", overflow: "hidden",
                 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span style={{ fontSize: 11, color: isToday ? COLORS.amber : COLORS.textMuted, fontWeight: isToday ? 700 : 500 }}>{day.getDate()}</span>
+                    <span style={{ fontSize: mfs(11), color: isToday ? COLORS.amber : COLORS.textMuted, fontWeight: isToday ? 700 : 500 }}>{day.getDate()}</span>
                     <button onClick={(e) => { e.stopPropagation(); onNewEvent(iso); }} style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer", padding: 0, display: "flex" }}><Plus size={11} /></button>
                   </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }}>
-                    {dayEvents.slice(0, 3).map(ev => (
-                      <div key={ev.id} style={{ fontSize: 10, borderRadius: 4, padding: "1px 4px", background: COLORS.bg, color: ev.detailed ? COLORS.text : COLORS.textMuted, borderLeft: `2px solid ${userColor(ev.ownerId, profiles)}`, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {ev.allDay ? "Cały dzień" : ev.start} {ev.detailed ? (ev.title || "") : "Zajęty/a"}
-                      </div>
-                    ))}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4, minWidth: 0 }}>
+                    {dayEvents.slice(0, 3).map(ev => {
+                      const label = ev.detailed ? (ev.title || "") : "Zajęty/a";
+                      const shortLabel = label.length > 15 ? label.slice(0, 15) + "…" : label;
+                      return (
+                        <div key={ev.id} style={{ fontSize: mfs(10), borderRadius: 4, padding: "1px 4px", background: COLORS.bg, color: ev.detailed ? COLORS.text : COLORS.textMuted, borderLeft: `2px solid ${userColor(ev.ownerId, profiles)}`, whiteSpace: "normal", wordBreak: "break-word", overflow: "hidden", minWidth: 0 }}>
+                          {ev.allDay ? "Cały dzień" : ev.start} {shortLabel}
+                        </div>
+                      );
+                    })}
                     {dayEvents.length > 3 && <div style={{ fontSize: 9.5, color: COLORS.textMuted }}>+{dayEvents.length - 3} więcej</div>}
                   </div>
                 </div>
@@ -1022,7 +1189,7 @@ function YearView({ anchorDate, profiles, eventsForDay, onMonthClick, onDayClick
         return (
           <div key={mi} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 10 }}>
             <div onClick={() => onMonthClick(monthDate)} style={{ cursor: "pointer", fontSize: 12.5, fontWeight: 600, marginBottom: 6, textTransform: "capitalize" }}>{mName}</div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 2 }}>
               {weeks.flat().map((day, i) => {
                 const iso = toISODate(day);
                 const inMonth = day.getMonth() === mi;
@@ -1089,7 +1256,85 @@ function EventCard({ ev, profiles, onClick }) {
 }
 
 // ================= EVENT MODAL =================
-function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, onSubmit, onSubmitSeries, onDelete, isUserBusy, conflictEventFor, onInviteUser, onRequestJoin, onDeleteRecurring }) {
+// ================= RECURRING OCCURRENCE (edycja/usuwanie z wyborem zakresu) =================
+function RecurringOccurrenceModal({ existing, profile, profiles, onClose, onEdit, onDelete, onDeleteWholeRule }) {
+  const canManage = profile.role === "admin" || existing.ownerId === profile.id;
+  const [label, setLabel] = useState(existing.title || "Niedostępny/a");
+  const [allDay, setAllDay] = useState(!!existing.allDay);
+  const [start, setStart] = useState(existing.start);
+  const [end, setEnd] = useState(existing.end);
+  const [editScope, setEditScope] = useState("this");
+  const [deleteScope, setDeleteScope] = useState("this");
+  const [busy, setBusy] = useState(false);
+
+  const EDIT_SCOPES = [["this", "Tylko ten dzień"], ["future", "Ten i przyszłe"], ["all", "Wszystkie wystąpienia"]];
+  const DELETE_SCOPES = [["this", "Tylko ten dzień"], ["future", "Ten i przyszłe"], ["past", "Ten i poprzednie"], ["all", "Wszystkie wystąpienia"]];
+
+  async function save() {
+    setBusy(true);
+    await onEdit(existing.recurringRuleId, existing.date, editScope, { label, allDay, start, end });
+    setBusy(false);
+    onClose();
+  }
+  async function remove() {
+    setBusy(true);
+    await onDelete(existing.recurringRuleId, existing.date, deleteScope);
+    setBusy(false);
+    onClose();
+  }
+
+  return (
+    <ModalShell onClose={onClose} title="Cykliczna niedostępność">
+      <div style={{ fontSize: 13, color: COLORS.textMuted, lineHeight: 1.6, marginBottom: 14 }}>
+        Wystąpienie z {existing.date}, {existing.allDay ? "cały dzień" : `${existing.start}–${existing.end}`}.
+        <br />Dotyczy: <b style={{ color: COLORS.text }}>{userName(existing.ownerId, profiles)}</b>.
+      </div>
+      {!canManage ? (
+        <button onClick={onClose} style={secondaryBtnStyle()}>Zamknij</button>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: 10 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600 }}>Edytuj</div>
+            <Field label="Nazwa"><Input value={label} onChange={setLabel} /></Field>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, cursor: "pointer" }}>
+              <input type="checkbox" checked={allDay} onChange={e => setAllDay(e.target.checked)} /> Cały dzień
+            </label>
+            {!allDay && (
+              <div style={{ display: "flex", gap: 8 }}>
+                <Field label="Od" style={{ flex: 1 }}><Input type="time" value={start} onChange={setStart} /></Field>
+                <Field label="Do" style={{ flex: 1 }}><Input type="time" value={end} onChange={setEnd} /></Field>
+              </div>
+            )}
+            <Field label="Zastosuj zmianę do">
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {EDIT_SCOPES.map(([id, lbl]) => (
+                  <button key={id} onClick={() => setEditScope(id)} style={{ padding: "6px 10px", borderRadius: 7, fontSize: 11.5, cursor: "pointer", border: `1px solid ${editScope === id ? COLORS.amber : COLORS.line}`, background: editScope === id ? COLORS.amber + "22" : "transparent", color: editScope === id ? COLORS.text : COLORS.textMuted }}>{lbl}</button>
+                ))}
+              </div>
+            </Field>
+            <button onClick={save} disabled={busy} style={{ ...primaryBtnStyle(), alignSelf: "flex-start" }}>Zapisz zmianę</button>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, background: COLORS.bg, border: `1px solid ${COLORS.rose}55`, borderRadius: 8, padding: 10 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.rose }}>Usuń</div>
+            <Field label="Zakres usunięcia">
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {DELETE_SCOPES.map(([id, lbl]) => (
+                  <button key={id} onClick={() => setDeleteScope(id)} style={{ padding: "6px 10px", borderRadius: 7, fontSize: 11.5, cursor: "pointer", border: `1px solid ${deleteScope === id ? COLORS.rose : COLORS.line}`, background: deleteScope === id ? COLORS.rose + "22" : "transparent", color: deleteScope === id ? COLORS.text : COLORS.textMuted }}>{lbl}</button>
+                ))}
+              </div>
+            </Field>
+            <button onClick={remove} disabled={busy} style={{ ...secondaryBtnStyle(), color: COLORS.rose, borderColor: COLORS.rose, alignSelf: "flex-start" }}><Trash2 size={14} /> Usuń wybrany zakres</button>
+          </div>
+
+          <button onClick={onClose} style={{ ...secondaryBtnStyle(), alignSelf: "flex-end" }}>Zamknij</button>
+        </div>
+      )}
+    </ModalShell>
+  );
+}
+
+function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, onSubmit, onSubmitSeries, onDelete, isUserBusy, conflictEventFor, onInviteUser, onRemoveParticipant, onRequestJoin, onDeleteRecurring, onDeleteRecurringOccurrence, onEditRecurringOccurrence, onDeleteSeries }) {
   const [form, setForm] = useState(() => existing ? {
     title: existing.title, date: existing.date, start: existing.start, end: existing.end, allDay: !!existing.allDay,
     location: existing.location || "", notes: existing.notes || "", type: existing.type, seriesMode: false, entries: [],
@@ -1101,6 +1346,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
   const [seriesError, setSeriesError] = useState("");
   const [seriesResult, setSeriesResult] = useState(null); // {count, skipped} after successful submit
   const [expandedEntry, setExpandedEntry] = useState(null); // która data ma rozwinięty edytor godzin/załogi
+  const [seriesDeleteScope, setSeriesDeleteScope] = useState("this");
 
   const MAX_SERIES_DAYS_AHEAD = 186; // ~6 miesięcy
   const MAX_SERIES_DATES = 150;
@@ -1144,24 +1390,7 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
   // editing one occurrence isn't supported; the whole rule is managed from
   // "Cykliczna niedostępność" instead.
   if (existing && existing.recurring) {
-    const canManage = profile.role === "admin" || existing.ownerId === profile.id;
-    return (
-      <ModalShell onClose={onClose} title="Cykliczna niedostępność">
-        <div style={{ fontSize: 13, color: COLORS.textMuted, lineHeight: 1.6, marginBottom: 14 }}>
-          To wystąpienie cyklicznej reguły{existing.detailed && existing.title ? ` „${existing.title}”` : ""} — {existing.date}, {existing.allDay ? "cały dzień" : `${existing.start}–${existing.end}`}.
-          <br />Dotyczy: <b style={{ color: COLORS.text }}>{userName(existing.ownerId, profiles)}</b>.
-          Pojedynczych wystąpień nie da się edytować — regułą zarządzasz w całości.
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          {canManage && (
-            <button onClick={() => { onDeleteRecurring({ id: existing.recurringRuleId, label: existing.title }); onClose(); }} style={{ ...secondaryBtnStyle(), color: COLORS.rose, borderColor: COLORS.rose }}>
-              <Trash2 size={14} /> Usuń całą regułę
-            </button>
-          )}
-          <button onClick={onClose} style={{ ...secondaryBtnStyle(), marginLeft: "auto" }}>Zamknij</button>
-        </div>
-      </ModalShell>
-    );
+    return <RecurringOccurrenceModal existing={existing} profile={profile} profiles={profiles} onClose={onClose} onEdit={onEditRecurringOccurrence} onDelete={onDeleteRecurringOccurrence} onDeleteWholeRule={onDeleteRecurring} />;
   }
 
   const canEdit = mode === "new" || profile.role === "admin" || (existing && existing.ownerId === profile.id);
@@ -1449,19 +1678,32 @@ function EventModal({ mode, profiles, profile, defaultDate, existing, onClose, o
               {existing.participants.map(p => (
                 <div key={p.userId} style={{ fontSize: 12.5, display: "flex", alignItems: "center", gap: 6, color: COLORS.textMuted }}>
                   <span style={{ width: 7, height: 7, borderRadius: "50%", background: userColor(p.userId, profiles) }} />
-                  {userName(p.userId, profiles)} — <span style={{ color: p.status === "accepted" ? COLORS.teal : p.status === "declined" ? COLORS.rose : COLORS.amber }}>{p.status === "accepted" ? "potwierdził(a)" : p.status === "declined" ? "odrzucił(a) / zajęty(a)" : "oczekuje"}</span>
+                  <span style={{ flex: 1 }}>{userName(p.userId, profiles)} — <span style={{ color: p.status === "accepted" ? COLORS.teal : p.status === "declined" ? COLORS.rose : COLORS.amber }}>{p.status === "accepted" ? "potwierdził(a)" : p.status === "declined" ? "odrzucił(a) / zajęty(a)" : "oczekuje"}</span></span>
+                  {(profile.role === "admin" || existing.ownerId === profile.id) && p.userId !== profile.id && (
+                    <button onClick={() => onRemoveParticipant(existing, p.userId)} title="Usuń tę osobę z terminu (np. dodana lub zaakceptowana omyłkowo)" style={{ fontSize: 10.5, padding: "3px 7px", borderRadius: 6, border: `1px solid ${COLORS.rose}`, background: "transparent", color: COLORS.rose, cursor: "pointer", flexShrink: 0 }}>Usuń</button>
+                  )}
                 </div>
               ))}
             </div>
           </Field>
         )}
 
-        <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-          {canEdit && <button onClick={submit} style={primaryBtnStyle()}>{mode === "new" ? (form.seriesMode ? `Utwórz serię (${form.entries.length})` : "Utwórz termin") : "Zapisz zmiany"}</button>}
-          {existing && (profile.role === "admin" || existing.ownerId === profile.id) && (
-            <button onClick={() => onDelete(existing)} style={{ ...secondaryBtnStyle(), color: COLORS.rose, borderColor: COLORS.rose }}><Trash2 size={14} /> Usuń</button>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6 }}>
+          {existing && existing.seriesId && (profile.role === "admin" || existing.ownerId === profile.id) && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 11, color: COLORS.textMuted }}>Ten termin jest częścią serii — usuń:</span>
+              {[["this", "tylko ten"], ["future", "ten i przyszłe"], ["past", "ten i poprzednie"], ["all", "wszystkie"]].map(([id, lbl]) => (
+                <button key={id} onClick={() => setSeriesDeleteScope(id)} style={{ padding: "4px 8px", borderRadius: 6, fontSize: 10.5, cursor: "pointer", border: `1px solid ${seriesDeleteScope === id ? COLORS.rose : COLORS.line}`, background: seriesDeleteScope === id ? COLORS.rose + "22" : "transparent", color: seriesDeleteScope === id ? COLORS.text : COLORS.textMuted }}>{lbl}</button>
+              ))}
+            </div>
           )}
-          <button onClick={onClose} style={{ ...secondaryBtnStyle(), marginLeft: "auto" }}>Zamknij</button>
+          <div style={{ display: "flex", gap: 8 }}>
+            {canEdit && <button onClick={submit} style={primaryBtnStyle()}>{mode === "new" ? (form.seriesMode ? `Utwórz serię (${form.entries.length})` : "Utwórz termin") : "Zapisz zmiany"}</button>}
+            {existing && (profile.role === "admin" || existing.ownerId === profile.id) && (
+              <button onClick={() => existing.seriesId ? onDeleteSeries(existing, seriesDeleteScope) : onDelete(existing)} style={{ ...secondaryBtnStyle(), color: COLORS.rose, borderColor: COLORS.rose }}><Trash2 size={14} /> Usuń</button>
+            )}
+            <button onClick={onClose} style={{ ...secondaryBtnStyle(), marginLeft: "auto" }}>Zamknij</button>
+          </div>
         </div>
       </div>
     </ModalShell>
@@ -1622,7 +1864,7 @@ function NotificationsView({ notifs, profiles, onAcceptInvite, onDeclineInvite, 
                     <button onClick={(e) => { e.stopPropagation(); onDeclineJoin(n); }} style={{ ...secondaryBtnStyle(), padding: "5px 10px", fontSize: 12 }}><X size={12} /> Odrzuć</button>
                   </div>
                 )}
-                {(n.type === "invite_response" || n.type === "join_response" || n.type === "event_cancelled" || n.type === "info") && (
+                {(n.type === "invite_response" || n.type === "join_response" || n.type === "event_cancelled" || n.type === "capacity_alert" || n.type === "info") && (
                   <button onClick={(e) => { e.stopPropagation(); onDismiss(n.id); }} style={{ fontSize: 11, color: COLORS.textMuted, background: "none", border: "none", cursor: "pointer", marginTop: 6, padding: 0 }}>Ukryj</button>
                 )}
               </div>
@@ -1634,7 +1876,7 @@ function NotificationsView({ notifs, profiles, onAcceptInvite, onDeclineInvite, 
   );
 }
 function NotifIcon({ type }) {
-  const map = { invite: <Bell size={15} color={COLORS.amber} />, join_request: <AlertTriangle size={15} color={COLORS.rose} />, invite_response: <Check size={15} color={COLORS.teal} />, join_response: <Check size={15} color={COLORS.teal} />, event_cancelled: <X size={15} color={COLORS.rose} />, info: <Bell size={15} color={COLORS.textMuted} /> };
+  const map = { invite: <Bell size={15} color={COLORS.amber} />, join_request: <AlertTriangle size={15} color={COLORS.rose} />, invite_response: <Check size={15} color={COLORS.teal} />, join_response: <Check size={15} color={COLORS.teal} />, event_cancelled: <X size={15} color={COLORS.rose} />, capacity_alert: <AlertTriangle size={15} color={COLORS.amber} />, info: <Bell size={15} color={COLORS.textMuted} /> };
   return map[type] || <Bell size={15} />;
 }
 
@@ -1679,18 +1921,32 @@ function ProfileView({ profile, onUpdate, onChangePassword }) {
 }
 
 // ================= ADMIN PANEL =================
-function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSendPasswordReset, onDeleteEvent, onEditEvent, bufferMinutes, onSetBufferMinutes }) {
+function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSendPasswordReset, onDeleteEvent, onEditEvent, bufferMinutes, onSetBufferMinutes, onExportBackup, onImportBackup }) {
   const [tab, setTab] = useState("team");
   const [bufferInput, setBufferInput] = useState(String(bufferMinutes));
+  const [importBusy, setImportBusy] = useState(false);
+  const [importMsg, setImportMsg] = useState("");
+  const fileInputRef = useRef(null);
   const pending = profiles.filter(p => !p.approved);
   const approved = profiles.filter(p => p.approved);
   const upcoming = events.slice().sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
+  const capacityPct = computeCapacityPct(events, profiles, 30, 8);
+
+  async function handleImportFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportBusy(true); setImportMsg("");
+    const res = await onImportBackup(file);
+    setImportBusy(false);
+    setImportMsg(res.ok ? `Zaimportowano ${res.count} terminów.` : `Błąd: ${res.error}`);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
 
   return (
     <div style={{ maxWidth: 780 }}>
       <div style={{ fontFamily: "Space Grotesk, sans-serif", fontWeight: 700, fontSize: 18, marginBottom: 14 }}>Panel admina</div>
       <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
-        {[["team", `Zespół${pending.length ? ` (${pending.length} oczekuje)` : ""}`], ["events", "Wszystkie terminy"], ["activity", "Aktywność"], ["settings", "Ustawienia"]].map(([id, label]) => (
+        {[["team", `Zespół${pending.length ? ` (${pending.length} oczekuje)` : ""}`], ["events", "Wszystkie terminy"], ["activity", "Aktywność"], ["settings", "Ustawienia"], ["backup", "Kopia zapasowa"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} style={{ padding: "7px 12px", borderRadius: 8, border: `1px solid ${tab === id ? COLORS.amber : COLORS.line}`, background: tab === id ? COLORS.amber + "22" : "transparent", color: COLORS.text, fontSize: 12.5, cursor: "pointer" }}>{label}</button>
         ))}
       </div>
@@ -1766,7 +2022,7 @@ function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSe
       )}
 
       {tab === "settings" && (
-        <div style={{ maxWidth: 420 }}>
+        <div style={{ maxWidth: 420, display: "flex", flexDirection: "column", gap: 16 }}>
           <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
             <div style={{ fontSize: 13, fontWeight: 600 }}>Bufor czasowy między zadaniami</div>
             <div style={{ fontSize: 12, color: COLORS.textMuted, lineHeight: 1.5 }}>
@@ -1779,6 +2035,40 @@ function AdminPanel({ profiles, events, auditLog, onSetApproved, onSetRole, onSe
             </div>
             <button onClick={() => onSetBufferMinutes(Math.max(0, parseInt(bufferInput, 10) || 0))} style={{ ...primaryBtnStyle(), alignSelf: "flex-start" }}>Zapisz</button>
           </div>
+
+          <div style={{ background: COLORS.panel, border: `1px solid ${capacityPct !== null && capacityPct > 35 ? COLORS.amber : COLORS.line}`, borderRadius: 10, padding: 16, display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Wykorzystanie kalendarza (najbliższe 30 dni)</div>
+            {capacityPct === null ? (
+              <div style={{ fontSize: 12, color: COLORS.textMuted }}>Brak danych (dodaj zatwierdzonych pracowników).</div>
+            ) : (
+              <>
+                <div style={{ fontSize: 24, fontWeight: 700, color: capacityPct > 35 ? COLORS.amber : COLORS.teal }}>{capacityPct.toFixed(0)}%</div>
+                <div style={{ height: 8, borderRadius: 5, background: COLORS.bg, overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${Math.min(100, capacityPct)}%`, background: capacityPct > 35 ? COLORS.amber : COLORS.teal }} />
+                </div>
+                <div style={{ fontSize: 11, color: COLORS.textMuted }}>Próg ostrzegawczy: 35%. Powyżej tego progu dostajesz jednorazowe (raz na dobę) powiadomienie.</div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === "backup" && (
+        <div style={{ maxWidth: 480, display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Eksport kopii zapasowej</div>
+            <div style={{ fontSize: 12, color: COLORS.textMuted, lineHeight: 1.5 }}>Pobiera plik .json ze wszystkimi terminami, uczestnikami i regułami cyklicznymi. Nie zawiera kont użytkowników (te zarządzane są przez logowanie).</div>
+            <button onClick={onExportBackup} style={{ ...primaryBtnStyle(), alignSelf: "flex-start" }}>Pobierz kopię zapasową</button>
+          </div>
+          <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Import (przywracanie)</div>
+            <div style={{ fontSize: 12, color: COLORS.textMuted, lineHeight: 1.5 }}>
+              Przywraca dane z pliku .json do TEJ SAMEJ bazy danych (np. po pomyłce). Wymaga, żeby konta użytkowników z kopii nadal istniały w systemie — to nie jest narzędzie do przenoszenia danych na inny projekt Supabase.
+            </div>
+            <input ref={fileInputRef} type="file" accept="application/json" onChange={handleImportFile} disabled={importBusy}
+              style={{ fontSize: 12, color: COLORS.text }} />
+            {importMsg && <div style={{ fontSize: 12, color: importMsg.startsWith("Błąd") ? COLORS.rose : COLORS.teal }}>{importMsg}</div>}
+          </div>
         </div>
       )}
     </div>
@@ -1790,6 +2080,8 @@ const ACTIVITY_LABELS = {
   join_request_sent: "Prośba o zmianę", join_request_accepted: "Zmiana terminu", join_request_declined: "Odrzucenie prośby",
   profile_updated: "Profil", password_changed: "Zmiana hasła", user_approved: "Zatwierdzenie", user_blocked: "Blokada", role_changed: "Zmiana roli",
   recurring_created: "Reguła cykliczna", recurring_deleted: "Usunięcie reguły",
+  buffer_updated: "Bufor czasowy", participant_removed: "Usunięcie uczestnika",
+  backup_exported: "Eksport kopii zapasowej", backup_imported: "Import kopii zapasowej",
 };
 function ActivityBadge({ action }) {
   return <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 20, border: `1px solid ${COLORS.line}`, color: COLORS.textMuted, flexShrink: 0, whiteSpace: "nowrap" }}>{ACTIVITY_LABELS[action] || action}</span>;
