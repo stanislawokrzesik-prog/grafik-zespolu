@@ -1135,18 +1135,23 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
   const weeks = monthMatrix(anchorDate);
   const currentMonth = anchorDate.getMonth();
   const todayIso = toISODate(new Date());
+  // Na telefonie 7 kolumn wciśniętych w pełną szerokość ekranu robi się nieczytelne
+  // (tekst łamie się litera po literze) — zamiast tego kolumny mają stałą, wygodną do
+  // czytania szerokość (ok. 3x szersze niż wcześniej), a cała siatka przewija się w bok.
+  const colTemplate = IS_MOBILE ? "repeat(7, minmax(128px, 1fr))" : "repeat(7, minmax(0, 1fr))";
   return (
-    <div style={{ width: "100%" }}>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6, marginBottom: 6 }}>
-        {DAY_NAMES.map(d => <div key={d} style={{ fontSize: mfs(11), color: COLORS.textMuted, textAlign: "center", fontWeight: 600 }}>{d}</div>)}
-      </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        {weeks.map((week, wi) => (
-          <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6 }}>
-            {week.map(day => {
-              const iso = toISODate(day);
-              const inMonth = day.getMonth() === currentMonth;
-              const isToday = inMonth && iso === todayIso;
+    <div style={{ width: "100%", overflowX: IS_MOBILE ? "auto" : "visible" }}>
+      <div style={{ minWidth: IS_MOBILE ? "896px" : "auto" }}>
+        <div style={{ display: "grid", gridTemplateColumns: colTemplate, gap: 6, marginBottom: 6 }}>
+          {DAY_NAMES.map(d => <div key={d} style={{ fontSize: mfs(11), color: COLORS.textMuted, textAlign: "center", fontWeight: 600 }}>{d}</div>)}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {weeks.map((week, wi) => (
+            <div key={wi} style={{ display: "grid", gridTemplateColumns: colTemplate, gap: 6 }}>
+              {week.map(day => {
+                const iso = toISODate(day);
+                const inMonth = day.getMonth() === currentMonth;
+                const isToday = inMonth && iso === todayIso;
               const dayEvents = eventsForDay(iso);
               return (
                 <div key={iso} onClick={() => onDayClick(day)} style={{
@@ -1172,8 +1177,9 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
                 </div>
               );
             })}
-          </div>
-        ))}
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
