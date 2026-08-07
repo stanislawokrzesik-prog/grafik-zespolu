@@ -764,7 +764,8 @@ export default function App() {
     } else if (pct <= 35) {
       capacityAlertRef.current = false;
     }
-  }, [events, profiles, profile]); // eslint-disable-line  const myNotifs = profile ? notifications.filter(n => n.userId === profile.id).sort((a, b) => b.timestamp - a.timestamp) : [];
+  }, [events, profiles, profile]); // eslint-disable-line
+  const myNotifs = profile ? notifications.filter(n => n.userId === profile.id).sort((a, b) => b.timestamp - a.timestamp) : [];
   const unreadCount = myNotifs.filter(n => !n.read).length;
   const pendingCount = profiles.filter(p => !p.approved).length;
 
