@@ -1167,7 +1167,7 @@ function MonthView({ anchorDate, profiles, eventsForDay, onNewEvent, onDayClick 
                       const label = ev.detailed ? (ev.title || "") : "Zajęty/a";
                       const shortLabel = label.length > 15 ? label.slice(0, 15) + "…" : label;
                       return (
-                        <div key={ev.id} style={{ fontSize: mfs(10), borderRadius: 4, padding: "1px 4px", background: COLORS.bg, color: ev.detailed ? COLORS.text : COLORS.textMuted, borderLeft: `2px solid ${userColor(ev.ownerId, profiles)}`, whiteSpace: "normal", wordBreak: "break-word", minWidth: 0 }}>
+                        <div key={ev.id} style={{ fontSize: mfs(10), borderRadius: 4, padding: "1px 4px", background: userColor(ev.ownerId, profiles) + "22", color: ev.detailed ? COLORS.text : COLORS.textMuted, borderLeft: `4px solid ${userColor(ev.ownerId, profiles)}`, whiteSpace: "normal", wordBreak: "break-word", minWidth: 0 }}>
                           {ev.allDay ? "Cały dzień" : ev.start} {shortLabel}
                         </div>
                       );
@@ -1234,7 +1234,7 @@ function EventCard({ ev, profiles, onClick }) {
   const timeLabel = ev.allDay ? "Cały dzień" : `${ev.start}–${ev.end}`;
   if (!ev.detailed) {
     return (
-      <div title="Zajęty/a — szczegóły widzi tylko właściciel terminu i admin" style={{ borderRadius: 8, padding: "7px 9px", background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderLeftWidth: 3, borderLeftColor: ownerColor, opacity: 0.85 }}>
+      <div title="Zajęty/a — szczegóły widzi tylko właściciel terminu i admin" style={{ borderRadius: 8, padding: "7px 9px", background: ownerColor + "22", border: `1px solid ${COLORS.line}`, borderLeftWidth: 6, borderLeftColor: ownerColor, opacity: 0.9 }}>
         <div style={{ fontSize: mfs(11), color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {timeLabel} {ev.recurring && <Repeat size={10} />}</div>
         <div style={{ fontSize: mfs(12.5), fontWeight: 600, margin: "2px 0", color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 5 }}><Ban size={11} /> Zajęty/a</div>
         <div style={{ display: "flex", gap: 3, marginTop: 5, flexWrap: "wrap" }}>
@@ -1246,7 +1246,7 @@ function EventCard({ ev, profiles, onClick }) {
     );
   }
   return (
-    <div onClick={onClick} style={{ cursor: "pointer", borderRadius: 8, padding: "7px 9px", background: COLORS.bg, border: `1px solid ${COLORS.line}`, borderLeftWidth: 3, borderLeftColor: ownerColor }}>
+    <div onClick={onClick} style={{ cursor: "pointer", borderRadius: 8, padding: "7px 9px", background: ownerColor + "22", border: `1px solid ${COLORS.line}`, borderLeftWidth: 6, borderLeftColor: ownerColor }}>
       <div style={{ fontSize: mfs(11), color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 4 }}><Clock size={10} /> {timeLabel} {ev.recurring && <Repeat size={10} />}</div>
       <div style={{ fontSize: mfs(12.5), fontWeight: 600, margin: "2px 0", color: isBlock ? COLORS.textMuted : COLORS.text, fontStyle: isBlock ? "italic" : "normal" }}>{isBlock ? "🚫 " : ""}{ev.title}</div>
       {ev.location && <div style={{ fontSize: 10.5, color: COLORS.textMuted, display: "flex", alignItems: "center", gap: 3 }}><MapPin size={9} /> {ev.location}</div>}
